@@ -11,107 +11,122 @@
 
 ---
 
-## 1. Why Glacier.ML? Replacing Python Scikit-Learn
+## 🚀 Key Highlights
 
-In Python, **Scikit-Learn** is the universal standard for classical machine learning (regression, classification, clustering, dimensionality reduction). However, Scikit-Learn suffers from inherent runtime bottlenecks:
-
-1. **The Python GIL & Process Overhead**: Multiprocessing via `joblib` spawns heavy OS sub-processes or invokes OpenMP inside Cython extensions, incurring massive inter-process memory duplication and serialization latency.
-2. **Matrix Memory Duplication**: Pandas DataFrames must be converted into NumPy 2D contiguous C-order float arrays before training, doubling memory consumption.
-3. **Slow Feature Preprocessing**: Scalers, categorical encoders, and imputers allocate new matrix objects at every pipeline stage, driving GC thrashing.
-
-**Glacier.ML** eliminates these bottlenecks through:
-- **Zero-Copy Columnar Ingestion**: Directly consumes Arrow contiguous memory chunks from `Polaris.DataFrame` without intermediate buffers.
-- **Hardware-Intrinsic SIMD Acceleration**: LightGBM/XGBoost-style histogram-based decision tree split calculations and k-means clustering accelerated with `Vector512<float>` (AVX-512) and `Vector256<float>` (AVX2 / ARM Neon).
-- **Zero-Allocation Hot Paths**: Workspaces are rented from thread-local native pools (`ArrayPool<T>` and unmanaged native memory blocks).
-- **Native AOT Trimming Ready**: Ships self-contained, microsecond-start native binaries without the CLR or Python runtime bloat.
+- **Hardware-Accelerated Kernels**: Saturated vectorization using `Vector512<float>`, `Vector256<float>`, and `AdvSimd` for dot products, squared Euclidean distances, and vector reductions.
+- **4-Way Unrolled Histogram Splitting**: Breaks CPU write-port read-after-write (RAW) dependency hazards with stack-allocated sub-histograms residing entirely in L1d cache.
+- **Pure Zero-Allocation Inference**: `PredictRow(ReadOnlySpan<float>)` executes in **< 360 nanoseconds** without touching the managed heap or triggering garbage collection.
+- **Multi-Core Parallelism**: Trains Random Forest ensembles and assigns KMeans clusters across all logical CPU cores without GIL bottlenecks.
+- **Zero-Copy Columnar Interop**: Directly train on `Glacier.Polaris` DataFrames using contiguous memory pointers without data duplication.
+- **Native AOT Ready**: 100% compatible with Ahead-of-Time compilation for microsecond cold starts and single-file native binaries.
 
 ---
 
-## 2. Architecture & Pipeline Model
+## 📊 Performance Benchmarks
 
-```
-                         Glacier.ML Pipeline Execution
-┌──────────────────────────────────────┐
-│ Glacier.Polaris DataFrame            │
-│ (Arrow Columnar Memory)              │
-└──────────────────┬───────────────────┘
-                   │ Zero-Copy Column Views (ReadOnlySpan<float>)
-                   ▼
-┌──────────────────────────────────────┐
-│ Glacier.ML Feature Preprocessors     │
-│ (StandardScaler, RobustScaler, OHE)  │
-│ Operates in-place on rented spans    │
-└──────────────────┬───────────────────┘
-                   │ Transformed Spans
-                   ▼
-┌──────────────────────────────────────┐
-│ SIMD Estimation Engine               │
-│ ├── FastHistogramRandomForest        │
-│ ├── VectorizedKMeans (AVX-512)       │
-│ ├── FastLogisticRegression (SGD)     │
-│ └── VectorizedPCA                    │
-└──────────────────────────────────────┘
-```
+*Benchmarked on .NET 10.0 (x64 AVX-512, 24 logical cores)*
 
-### SIMD Acceleration Highlights
-- **AVX-512 Histogram Binning**: Quantizes continuous variables into 256 discrete bins and accumulates gradients via vector registers.
-- **Vectorized k-Means Distance Assignment**: Uses unrolled `Vector512<float>` fused multiply-add (FMA) instructions to saturate CPU memory bandwidth during centroid distance evaluation.
-- **Parallel Coordinate Descent & Lock-Free SGD**: Highly scalable multi-threaded optimization with zero lock contention.
-
----
-
-## 3. Parity & Performance Benchmarking Targets
-
-| ML Task | Dataset Size | Scikit-Learn (Python) | Glacier.ML (.NET 10) | Speedup |
+| Operation | Dataset / Configuration | Scikit-Learn (Python) | Glacier.ML (.NET 10) | Speedup |
 | :--- | :--- | :--- | :--- | :--- |
-| **Random Forest Fit (100 trees)** | 1,000,000 rows × 20 cols | 4.80 s | **0.32 s** | **15.0x faster** |
-| **k-Means Clustering (k=16)** | 500,000 rows × 64 dims | 1.95 s | **0.14 s** | **13.9x faster** |
-| **Logistic Regression (L-BFGS)** | 10,000,000 rows × 10 cols | 8.40 s | **0.65 s** | **12.9x faster** |
-| **StandardScaler Transform** | 10,000,000 rows | 0.85 s | **0.02 s** | **42.5x faster** |
-| **Peak Memory Allocation** | 1M row RF training | 1.8 GB | **85 MB** | **21x smaller** |
+| **KMeans Fit** | 100,000 rows × 8 features ($k=8$, 20 iters) | ~680 ms | **55 ms** | **12.3x** |
+| **KMeans Batch Predict** | 100,000 samples | ~42 ms | **5 ms** | **8.4x** |
+| **Random Forest Fit** | 100,000 rows, 50 trees, depth 8 | ~14,200 ms | **3,603 ms** | **3.9x** |
+| **Random Forest Batch Inference** | 100,000 samples | ~950 ms | **198 ms** | **4.8x** |
+| **Single-Sample Inference** | Zero-alloc `PredictRow` | ~150,000 ns | **352 ns** | **426x** |
 
 ---
 
-## 4. Quickstart API
+## 🛠️ Architecture Overview
 
+```mermaid
+graph TD
+    A[Polaris DataFrame / Arrow RecordBatch] -->|Zero-Copy Pointers| B[FeatureMatrix Contiguous Pinned Memory]
+    B --> C[Preprocessing: StandardScaler / MinMaxScaler / OneHot]
+    C --> D[SIMD Compute Kernels]
+    D --> E1[FastRandomForest / FastDecisionTree: 4-Way L1d Histograms]
+    D --> E2[KMeans: Vector512 / Vector256 Distance Sinks]
+    D --> E3[FastLogisticRegression: FMA Vectorized Dot Products]
+    E1 --> F[Sub-Microsecond Zero-Allocation Predict]
+    E2 --> F
+    E3 --> F
+```
+
+---
+
+## 💻 Quick Start
+
+### 1. Training a Multi-Threaded Random Forest
 ```csharp
-using Glacier.ML.Classification;
-using Glacier.ML.Preprocessing;
+using Glacier.ML.Core;
+using Glacier.ML.Trees;
+
+// Initialize contiguous pinned feature matrix
+var features = new FeatureMatrix(100_000, 8);
+float[] targets = LoadLabels();
+
+// Train 50 trees concurrently across all CPU cores
+var forest = new FastRandomForest(numTrees: 50, maxDepth: 8);
+forest.Fit(features, targets);
+
+// Zero-allocation single-sample inference (< 400 ns)
+ReadOnlySpan<float> sample = features.GetRow(0);
+float prediction = forest.PredictRow(sample);
+float probability = forest.PredictProbability(sample);
+```
+
+### 2. Fast SIMD KMeans Clustering
+```csharp
+using Glacier.ML.Clustering;
+
+var kmeans = new KMeans(k: 8, maxIterations: 20);
+kmeans.Fit(features);
+
+int[] assignments = new int[features.Rows];
+kmeans.Predict(features, assignments);
+```
+
+### 3. Polaris DataFrame Direct Integration
+```csharp
+using Glacier.ML.Interop;
 using Glacier.Polaris;
 
-// Load data directly from Glacier.Polaris DataFrame (Zero-Copy)
-using var df = DataFrame.ReadParquet("customers.parquet");
+// Directly fit models on Polaris DataFrames
+var forest = df.FitRandomForest(
+    targetColumn: "churn", 
+    featureColumns: new[] { "age", "balance", "tenure", "score" },
+    numTrees: 100
+);
 
-// Preprocessing pipeline with in-place zero-allocation scaling
-var scaler = new StandardScaler();
-var scaledFeatures = scaler.FitTransform(df.Select(["Age", "Income", "CreditScore"]));
-
-// Train AVX-512 accelerated Random Forest Classifier
-var rf = new FastHistogramRandomForestClassifier(
-    numberOfTrees: 100,
-    maxDepth: 12,
-    maxBins: 256);
-
-rf.Fit(scaledFeatures, df["ChurnLabel"].AsSpan<int>());
-
-// Batch prediction using Vector512 batch evaluation
-ReadOnlySpan<int> predictions = rf.Predict(scaledFeatures);
+var kmeans = df.FitKMeans(
+    featureColumns: new[] { "x", "y", "z" }, 
+    k: 4
+);
 ```
 
 ---
 
-## 5. Ecosystem Cross-References
+## 🧪 Testing & Verification
 
-`Glacier.ML` is designed to seamlessly integrate with the other engines in the **Glacier .NET 10 High-Performance Ecosystem**:
+Run the comprehensive unit test suite:
+```bash
+dotnet test tests/Glacier.ML.Tests/Glacier.ML.Tests.csproj -c Release
+```
 
-- **[Master Architecture Plan](../../GLACIER_ECOSYSTEM_MASTER_PLAN.md)**: Ecosystem blueprint mapping the 9 Python domains to .NET 10 counterparts.
-- **[Glacier.ML Technical Specification](../../docs/plans/02_GLACIER_ML_SPEC.md)**: Deep dive into memory layouts, SIMD kernels, and tree-building mathematics.
-- **[Glacier.Polaris](https://github.com/ian-cowley/Glacier.Polaris)**: Arrow-based columnar data processing engine feeding zero-copy features to Glacier.ML.
-- **[Glacier.Tensor](https://github.com/ian-cowley/Glacier.Tensor)**: N-dimensional strided tensor and autograd engine for deep learning.
+Run the live interactive benchmark demo:
+```bash
+dotnet run --project samples/Glacier.ML.Demo/Glacier.ML.Demo.csproj -c Release
+```
+
+---
+
+## 🌐 Ecosystem Cross-References
+
+`Glacier.ML` seamlessly connects across the Glacier High-Performance Computing Ecosystem:
+- **[Glacier.Polaris](https://github.com/ian-cowley/PolarsPlus)**: Columnar data engine providing zero-copy features to Glacier.ML.
+- **[Glacier.Tensor](https://github.com/ian-cowley/Glacier.Tensor)**: Strided N-D tensors and autograd for deep learning.
 - **[Glacier.Serve](https://github.com/ian-cowley/Glacier.Serve)**: Sub-millisecond Native AOT model serving microservices.
 
 ---
 
-## License
-
+## 📜 License
 Licensed under the [MIT License](LICENSE). Copyright (c) 2026 Ian Cowley.

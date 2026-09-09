@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Version>1.0.0</Version>
+    <PackageId>Glacier.ML</PackageId>
+    <Authors>Ian Cowley</Authors>
+    <Company>Glacier</Company>
+    <Description>High-performance, SIMD-accelerated classical machine learning engine for .NET 10. Native C# alternative to Scikit-Learn with zero-copy Polaris DataFrame training.</Description>
+    <PackageTags>machine-learning ml scikit-learn random-forest decision-trees kmeans simd avx512 dotnet csharp high-performance</PackageTags>
+    <RepositoryUrl>https://github.com/ian-cowley/Glacier.ML</RepositoryUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TieredPGO>true</TieredPGO>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <LangVersion>preview</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\Glacier.Polaris\src\Glacier.Polaris\Glacier.Polaris.csproj" />
+  </ItemGroup>
+</Project>

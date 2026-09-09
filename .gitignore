@@ -2,6 +2,7 @@
 [Bb]in/
 [Oo]bj/
 [Rr]elease/
+TestResults/
 
 # IDE and editor folders
 .vs/
