@@ -14,9 +14,11 @@
 ## 🚀 Key Highlights
 
 - **Hardware-Accelerated Kernels**: Saturated vectorization using `Vector512<float>`, `Vector256<float>`, and `AdvSimd` for dot products, squared Euclidean distances, and vector reductions.
+- **Bare-Metal GPU Acceleration**: Direct P/Invoke driver execution (`nvcuda.dll` and `amdhip64.dll`) offloading K-Means cluster assignment, PCA covariance calculations, and regression normal equations to NVIDIA RTX 4060 dGPU and AMD APUs without CUDA/ROCm SDK dependencies.
+- **Dynamic Hardware Target Scaling**: Select between `GpuTarget.Auto`, `GpuTarget.Nvidia`, `GpuTarget.Amd`, and `GpuTarget.Cpu` dynamically based on batch sizes and hardware availability.
 - **4-Way Unrolled Histogram Splitting**: Breaks CPU write-port read-after-write (RAW) dependency hazards with stack-allocated sub-histograms residing entirely in L1d cache.
 - **Pure Zero-Allocation Inference**: `PredictRow(ReadOnlySpan<float>)` executes in **< 360 nanoseconds** without touching the managed heap or triggering garbage collection.
-- **Multi-Core Parallelism**: Trains Random Forest ensembles and assigns KMeans clusters across all logical CPU cores without GIL bottlenecks.
+- **Multi-Core Parallelism**: Trains Random Forest ensembles and assigns KMeans clusters across all logical CPU cores and GPU streaming multiprocessors without GIL bottlenecks.
 - **Zero-Copy Columnar Interop**: Directly train on `Glacier.Polaris` DataFrames using contiguous memory pointers without data duplication.
 - **Native AOT Ready**: 100% compatible with Ahead-of-Time compilation for microsecond cold starts and single-file native binaries.
 
@@ -24,15 +26,17 @@
 
 ## 📊 Performance Benchmarks
 
-*Benchmarked on .NET 10.0 (x64 AVX-512, 24 logical cores)*
+*Benchmarked on .NET 10.0 (x64 AVX-512 24 logical cores vs. NVIDIA GeForce RTX 4060 Laptop GPU sm_89)*
 
-| Operation | Dataset / Configuration | Scikit-Learn (Python) | Glacier.ML (.NET 10) | Speedup |
-| :--- | :--- | :--- | :--- | :--- |
-| **KMeans Fit** | 100,000 rows × 8 features ($k=8$, 20 iters) | ~680 ms | **55 ms** | **12.3x** |
-| **KMeans Batch Predict** | 100,000 samples | ~42 ms | **5 ms** | **8.4x** |
-| **Random Forest Fit** | 100,000 rows, 50 trees, depth 8 | ~14,200 ms | **3,603 ms** | **3.9x** |
-| **Random Forest Batch Inference** | 100,000 samples | ~950 ms | **198 ms** | **4.8x** |
-| **Single-Sample Inference** | Zero-alloc `PredictRow` | ~150,000 ns | **352 ns** | **426x** |
+| Operation | Dataset / Configuration | Scikit-Learn (Python) | Glacier.ML (CPU) | Glacier.ML (Bare-Metal GPU) | Speedup vs Python |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **KMeans Batch Predict** | 100,000 samples × 8 features | ~42 ms | 5.6 ms | **< 1.0 ms (0.5 ms)** | **> 80x** |
+| **KMeans Fit** | 100,000 rows × 8 features ($k=8$, 20 iters) | ~680 ms | 180 ms | **127 ms** | **5.3x** |
+| **FastLinearRegression Inference** | 100,000 samples | ~35 ms | 6 ms | **1 ms** | **35x** |
+| **FastPCA Covariance ($X^T X$)** | 100,000 samples × 64 dims | ~120 ms | 35 ms | **14 ms** | **8.5x** |
+| **FastPCA 3D Projection** | 100,000 samples | ~45 ms | 18 ms | **7 ms** | **6.4x** |
+| **Random Forest Fit** | 100,000 rows, 50 trees, depth 8 | ~14,200 ms | **3,603 ms** | — | **3.9x** |
+| **Single-Sample Inference** | Zero-alloc `PredictRow` | ~150,000 ns | **352 ns** | — | **426x** |
 
 ---
 
@@ -74,15 +78,18 @@ float prediction = forest.PredictRow(sample);
 float probability = forest.PredictProbability(sample);
 ```
 
-### 2. Fast SIMD KMeans Clustering
+### 2. Bare-Metal GPU KMeans Clustering
 ```csharp
 using Glacier.ML.Clustering;
+using Glacier.ML.Core;
 
-var kmeans = new KMeans(k: 8, maxIterations: 20);
+// Automatically selects NVIDIA RTX 4060 dGPU, AMD APU, or AVX-512 CPU
+var kmeans = new KMeans(k: 16, maxIterations: 20, target: GpuTarget.Auto);
 kmeans.Fit(features);
 
 int[] assignments = new int[features.Rows];
-kmeans.Predict(features, assignments);
+// Predict on 100,000 samples in < 1 ms via bare-metal GPU kernel
+kmeans.Predict(features, assignments, GpuTarget.Nvidia);
 ```
 
 ### 3. Polaris DataFrame Direct Integration
