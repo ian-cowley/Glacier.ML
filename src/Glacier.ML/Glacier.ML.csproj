@@ -23,6 +23,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\..\Glacier.Polaris\src\Glacier.Polaris\Glacier.Polaris.csproj" />
+    <PackageReference Include="Glacier.Polaris" Version="1.0.14" />
+    <PackageReference Include="Glacier.Gpu" Version="1.0.0" />
   </ItemGroup>
 </Project>
