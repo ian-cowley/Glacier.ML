@@ -7,6 +7,7 @@ using Glacier.ML.Clustering;
 using Glacier.ML.Core;
 using Glacier.ML.Linear;
 using Glacier.ML.Preprocessing;
+using System.Linq;
 using Glacier.ML.Trees;
 
 Console.ForegroundColor = ConsoleColor.Cyan;
@@ -112,3 +113,9 @@ Console.WriteLine("=============================================================
 Console.WriteLine("  Glacier.ML demonstration completed with 100% success!");
 Console.WriteLine("================================================================================");
 Console.ResetColor();
+
+if (!args.Contains("--headless") && !args.Contains("--bench") && Environment.UserInteractive && !Console.IsInputRedirected)
+{
+    Console.WriteLine("\n[Press any key to exit...]");
+    Console.ReadKey();
+}
