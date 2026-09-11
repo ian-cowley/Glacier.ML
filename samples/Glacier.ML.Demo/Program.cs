@@ -11,7 +11,6 @@ using Glacier.ML.Decomposition;
 using Glacier.ML.Linear;
 using Glacier.ML.Preprocessing;
 using Glacier.ML.Trees;
-using Glacier.Tensor.Compute;
 
 Console.ForegroundColor = ConsoleColor.Cyan;
 Console.WriteLine("================================================================================");

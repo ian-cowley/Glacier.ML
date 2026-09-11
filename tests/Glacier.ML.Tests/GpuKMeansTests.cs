@@ -2,7 +2,6 @@ using System;
 using Glacier.ML.Clustering;
 using Glacier.ML.Compute;
 using Glacier.ML.Core;
-using Glacier.Tensor.Compute;
 using Xunit;
 
 namespace Glacier.ML.Tests;

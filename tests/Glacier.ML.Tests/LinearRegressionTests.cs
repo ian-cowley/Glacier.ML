@@ -1,7 +1,6 @@
 using System;
 using Glacier.ML.Core;
 using Glacier.ML.Linear;
-using Glacier.Tensor.Compute;
 using Xunit;
 
 namespace Glacier.ML.Tests;

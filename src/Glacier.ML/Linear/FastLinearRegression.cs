@@ -3,7 +3,6 @@ using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Glacier.ML.Compute;
 using Glacier.ML.Core;
-using Glacier.Tensor.Compute;
 
 namespace Glacier.ML.Linear;
 

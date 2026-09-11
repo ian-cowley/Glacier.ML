@@ -2,12 +2,12 @@ using System;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Glacier.Gpu.Drivers;
 using Glacier.ML.Core;
-using Glacier.Tensor.Compute;
-using Glacier.Tensor.Core;
 
 namespace Glacier.ML.Compute;
 
@@ -345,22 +345,27 @@ public static unsafe class GpuMlAccelerator
             }
         });
 
-        // Compute G = X_T (D x N) * X (N x D) -> (D x D)
-        using var tensorXt = new Tensor<float>(d, n);
-        using var tensorX = new Tensor<float>(n, d);
-        using var tensorG = new Tensor<float>(d, d);
-
-        xTransposed.AsSpan().CopyTo(tensorXt.AsSpan());
-        xRaw.AsSpan(0, n * d).CopyTo(tensorX.AsSpan());
-
-        GpuAccelerator.AcceleratedMatMul(tensorXt, tensorX, tensorG, target);
-
-        tensorG.AsSpan().CopyTo(gram);
+        // Symmetric Gram calculation: G[i, j] = G[j, i] = dot(col_i, col_j)
+        fixed (float* pGram = gram)
+        {
+            float* pG = pGram;
+            Parallel.For(0, d, i =>
+            {
+                var colI = xTransposed.AsSpan(i * n, n);
+                for (int j = i; j < d; j++)
+                {
+                    var colJ = xTransposed.AsSpan(j * n, n);
+                    float val = DotProductSimd(colI, colJ);
+                    pG[i * d + j] = val;
+                    pG[j * d + i] = val;
+                }
+            });
+        }
     }
 
     /// <summary>
     /// Computes feature projection Y = X * W where X is (N x D) and W is (D x K), producing (N x K).
-    /// Used for PCA dimensionality reduction and linear prediction.
+    /// Highly optimized with SIMD multi-threading for PCA dimensionality reduction and linear prediction.
     /// </summary>
     public static void ProjectFeatures(
         FeatureMatrix x,
@@ -376,16 +381,75 @@ public static unsafe class GpuMlAccelerator
         if (destination.Length < n * k)
             throw new ArgumentException("Destination buffer length mismatch.", nameof(destination));
 
-        using var tensorX = new Tensor<float>(n, d);
-        using var tensorW = new Tensor<float>(d, k);
-        using var tensorY = new Tensor<float>(n, k);
+        float[] xRaw = x.RawArray;
 
-        x.RawArray.AsSpan(0, n * d).CopyTo(tensorX.AsSpan());
-        weights.Slice(0, d * k).CopyTo(tensorW.AsSpan());
+        // Transpose weights so each component's weights of length D are contiguous in memory: W_T (K x D)
+        float[] wTransposed = GC.AllocateArray<float>(k * d, pinned: true);
+        for (int p = 0; p < d; p++)
+        {
+            for (int j = 0; j < k; j++)
+            {
+                wTransposed[j * d + p] = weights[p * k + j];
+            }
+        }
 
-        GpuAccelerator.AcceleratedMatMul(tensorX, tensorW, tensorY, target);
+        fixed (float* pDest = destination)
+        {
+            float* pD = pDest;
+            Parallel.For(0, n, i =>
+            {
+                ReadOnlySpan<float> xRow = xRaw.AsSpan(i * d, d);
+                int yOffset = i * k;
+                for (int j = 0; j < k; j++)
+                {
+                    ReadOnlySpan<float> wComp = wTransposed.AsSpan(j * d, d);
+                    pD[yOffset + j] = DotProductSimd(xRow, wComp);
+                }
+            });
+        }
+    }
 
-        tensorY.AsSpan().CopyTo(destination);
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    private static float DotProductSimd(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
+    {
+        float sum = 0f;
+        int i = 0;
+        int length = a.Length;
+
+        if (Vector512.IsHardwareAccelerated && length >= Vector512<float>.Count)
+        {
+            var acc512 = Vector512<float>.Zero;
+            int step = Vector512<float>.Count;
+            int limit = length - step;
+            while (i <= limit)
+            {
+                var va = Vector512.LoadUnsafe(ref MemoryMarshal.GetReference(a), (nuint)i);
+                var vb = Vector512.LoadUnsafe(ref MemoryMarshal.GetReference(b), (nuint)i);
+                acc512 = Vector512.FusedMultiplyAdd(va, vb, acc512);
+                i += step;
+            }
+            sum += Vector512.Sum(acc512);
+        }
+        else if (Vector256.IsHardwareAccelerated && length >= Vector256<float>.Count)
+        {
+            var acc256 = Vector256<float>.Zero;
+            int step = Vector256<float>.Count;
+            int limit = length - step;
+            while (i <= limit)
+            {
+                var va = Vector256.LoadUnsafe(ref MemoryMarshal.GetReference(a), (nuint)i);
+                var vb = Vector256.LoadUnsafe(ref MemoryMarshal.GetReference(b), (nuint)i);
+                acc256 = Vector256.FusedMultiplyAdd(va, vb, acc256);
+                i += step;
+            }
+            sum += Vector256.Sum(acc256);
+        }
+
+        for (; i < length; i++)
+        {
+            sum += a[i] * b[i];
+        }
+        return sum;
     }
 
     #endregion
