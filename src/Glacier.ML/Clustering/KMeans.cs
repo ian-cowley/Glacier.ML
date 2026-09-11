@@ -1,32 +1,39 @@
 using System;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
+using Glacier.ML.Compute;
 using Glacier.ML.Core;
+using Glacier.Tensor.Compute;
 
 namespace Glacier.ML.Clustering;
 
 /// <summary>
 /// Hardware-accelerated k-means clustering engine for .NET 10.
+/// Supports bare-metal GPU acceleration (NVIDIA RTX 4060 dGPU, AMD Radeon 890M APU, Auto, and CPU).
 /// </summary>
 public sealed class KMeans
 {
     private readonly int _k;
     private readonly int _maxIterations;
     private readonly float _tolerance;
+    private readonly GpuTarget _target;
     private float[] _centroids = Array.Empty<float>();
     private int _dimensions;
 
     public int K => _k;
     public int MaxIterations => _maxIterations;
+    public float Tolerance => _tolerance;
+    public GpuTarget Target => _target;
     public float[] Centroids => _centroids;
     public int Dimensions => _dimensions;
 
-    public KMeans(int k = 8, int maxIterations = 100, float tolerance = 1e-4f)
+    public KMeans(int k = 8, int maxIterations = 100, float tolerance = 1e-4f, GpuTarget target = GpuTarget.Auto)
     {
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
         _k = k;
         _maxIterations = maxIterations;
         _tolerance = tolerance;
+        _target = target;
     }
 
     public void Fit(FeatureMatrix features)
@@ -87,11 +94,15 @@ public sealed class KMeans
             Array.Clear(newCentroids);
             Array.Clear(clusterCounts);
 
-            // E-step: Assign points to nearest centroid in parallel
-            Parallel.For(0, rows, r =>
+            // E-step: Assign points to nearest centroid using GPU or multi-core AVX-512
+            bool usedGpu = GpuMlAccelerator.AssignClustersGpu(features.Span, _centroids, assignments, rows, k, cols, _target);
+            if (!usedGpu)
             {
-                assignments[r] = KMeansKernels.FindNearestCentroid(features.GetRow(r), _centroids, k, cols);
-            });
+                Parallel.For(0, rows, r =>
+                {
+                    assignments[r] = KMeansKernels.FindNearestCentroid(features.GetRow(r), _centroids, k, cols);
+                });
+            }
 
             // M-step: Recompute centroids
             for (int r = 0; r < rows; r++)
@@ -132,19 +143,31 @@ public sealed class KMeans
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Predict(FeatureMatrix features, Span<int> clusterAssignments)
     {
+        Predict(features, clusterAssignments, _target);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public void Predict(FeatureMatrix features, Span<int> clusterAssignments, GpuTarget target)
+    {
         int rows = features.Rows;
         int cols = features.Columns;
         int k = Math.Min(_k, rows);
+
+        if (GpuMlAccelerator.AssignClustersGpu(features.Span, _centroids, clusterAssignments, rows, k, cols, target))
+        {
+            return;
+        }
 
         unsafe
         {
             fixed (float* pData = features.RawArray)
             fixed (float* pCent = _centroids)
+            fixed (int* pAssign = clusterAssignments)
             {
                 for (int r = 0; r < rows; r++)
                 {
                     float* pRow = pData + (r * cols);
-                    clusterAssignments[r] = KMeansKernels.FindNearestCentroid(pRow, pCent, k, cols);
+                    pAssign[r] = KMeansKernels.FindNearestCentroid(pRow, pCent, k, cols);
                 }
             }
         }
