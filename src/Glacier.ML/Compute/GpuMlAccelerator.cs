@@ -7,6 +7,8 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Gpu.Drivers;
+using Glacier.Gpu.Engines;
+using Glacier.Gpu.RingBuffer;
 using Glacier.ML.Core;
 
 namespace Glacier.ML.Compute;
@@ -33,6 +35,17 @@ public static unsafe class GpuMlAccelerator
     private static nuint s_capSamples;
     private static nuint s_capCentroids;
     private static nuint s_capAssignments;
+
+    // Persistent Megakernel Ring Buffer engine & unified device-mapped memory
+    private static NvidiaSassEngine? s_nvidiaEngine;
+    private static PersistentRingBuffer? s_ringBuffer;
+    private static IntPtr s_hVecA;
+    private static IntPtr s_dVecA;
+    private static IntPtr s_hVecB;
+    private static IntPtr s_dVecB;
+    private static IntPtr s_hVecC;
+    private static IntPtr s_dVecC;
+    private static nuint s_capVecBytes;
 
     private static bool s_amdInitialized;
     private static bool s_amdAvailable;
@@ -331,35 +344,43 @@ public static unsafe class GpuMlAccelerator
         if (gram.Length < d * d)
             throw new ArgumentException("Gram buffer is too small.", nameof(gram));
 
-        // Transpose X into X_T (size D x N)
-        // Using cache-friendly block transpose
-        float[] xTransposed = GC.AllocateArray<float>(d * n, pinned: true);
-        float[] xRaw = x.RawArray;
+        // Transpose X into X_T (size D x N) using 64-byte aligned unmanaged scratchpad to avoid LOH fragmentation
+        nuint byteCount = (nuint)d * (nuint)n * sizeof(float);
+        float* pXTransposed = (float*)NativeMemory.AlignedAlloc(byteCount, 64);
 
-        System.Threading.Tasks.Parallel.For(0, d, col =>
+        try
         {
-            int colOffset = col * n;
-            for (int row = 0; row < n; row++)
-            {
-                xTransposed[colOffset + row] = xRaw[row * d + col];
-            }
-        });
+            float[] xRaw = x.RawArray;
 
-        // Symmetric Gram calculation: G[i, j] = G[j, i] = dot(col_i, col_j)
-        fixed (float* pGram = gram)
-        {
-            float* pG = pGram;
-            Parallel.For(0, d, i =>
+            System.Threading.Tasks.Parallel.For(0, d, col =>
             {
-                var colI = xTransposed.AsSpan(i * n, n);
-                for (int j = i; j < d; j++)
+                int colOffset = col * n;
+                for (int row = 0; row < n; row++)
                 {
-                    var colJ = xTransposed.AsSpan(j * n, n);
-                    float val = DotProductSimd(colI, colJ);
-                    pG[i * d + j] = val;
-                    pG[j * d + i] = val;
+                    pXTransposed[colOffset + row] = xRaw[row * d + col];
                 }
             });
+
+            // Symmetric Gram calculation: G[i, j] = G[j, i] = dot(col_i, col_j)
+            fixed (float* pGram = gram)
+            {
+                float* pG = pGram;
+                Parallel.For(0, d, i =>
+                {
+                    var colI = new ReadOnlySpan<float>(pXTransposed + (i * n), n);
+                    for (int j = i; j < d; j++)
+                    {
+                        var colJ = new ReadOnlySpan<float>(pXTransposed + (j * n), n);
+                        float val = DotProductSimd(colI, colJ);
+                        pG[i * d + j] = val;
+                        pG[j * d + i] = val;
+                    }
+                });
+            }
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(pXTransposed);
         }
     }
 
@@ -384,28 +405,37 @@ public static unsafe class GpuMlAccelerator
         float[] xRaw = x.RawArray;
 
         // Transpose weights so each component's weights of length D are contiguous in memory: W_T (K x D)
-        float[] wTransposed = GC.AllocateArray<float>(k * d, pinned: true);
-        for (int p = 0; p < d; p++)
-        {
-            for (int j = 0; j < k; j++)
-            {
-                wTransposed[j * d + p] = weights[p * k + j];
-            }
-        }
+        nuint byteCount = (nuint)k * (nuint)d * sizeof(float);
+        float* pWTransposed = (float*)NativeMemory.AlignedAlloc(byteCount, 64);
 
-        fixed (float* pDest = destination)
+        try
         {
-            float* pD = pDest;
-            Parallel.For(0, n, i =>
+            for (int p = 0; p < d; p++)
             {
-                ReadOnlySpan<float> xRow = xRaw.AsSpan(i * d, d);
-                int yOffset = i * k;
                 for (int j = 0; j < k; j++)
                 {
-                    ReadOnlySpan<float> wComp = wTransposed.AsSpan(j * d, d);
-                    pD[yOffset + j] = DotProductSimd(xRow, wComp);
+                    pWTransposed[j * d + p] = weights[p * k + j];
                 }
-            });
+            }
+
+            fixed (float* pDest = destination)
+            {
+                float* pD = pDest;
+                Parallel.For(0, n, i =>
+                {
+                    ReadOnlySpan<float> xRow = xRaw.AsSpan(i * d, d);
+                    int yOffset = i * k;
+                    for (int j = 0; j < k; j++)
+                    {
+                        ReadOnlySpan<float> wComp = new ReadOnlySpan<float>(pWTransposed + (j * d), d);
+                        pD[yOffset + j] = DotProductSimd(xRow, wComp);
+                    }
+                });
+            }
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(pWTransposed);
         }
     }
 
@@ -450,6 +480,243 @@ public static unsafe class GpuMlAccelerator
             sum += a[i] * b[i];
         }
         return sum;
+    }
+
+    #endregion
+
+    #region Persistent Ring Buffer Vector Operations
+
+    /// <summary>
+    /// Gets or lazily initializes the persistent GPU ring buffer worker.
+    /// </summary>
+    public static PersistentRingBuffer? GetRingBuffer()
+    {
+        if (s_ringBuffer != null && !s_ringBuffer.IsDisposed) return s_ringBuffer;
+        lock (s_initLock)
+        {
+            if (s_ringBuffer != null && !s_ringBuffer.IsDisposed) return s_ringBuffer;
+            if (!EnsureNvidiaInitialized()) return null;
+
+            try
+            {
+                s_nvidiaEngine ??= new NvidiaSassEngine();
+                if (!s_nvidiaEngine.IsInitialized)
+                    s_nvidiaEngine.Initialize();
+
+                s_ringBuffer = s_nvidiaEngine.GetOrCreateRingBuffer(256);
+                return s_ringBuffer;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
+
+    private static bool EnsureVectorBuffers(nuint requiredBytes)
+    {
+        if (requiredBytes <= s_capVecBytes) return true;
+
+        if (s_hVecA != IntPtr.Zero) { CuDriver.MemFreeHost(s_hVecA); s_hVecA = s_dVecA = IntPtr.Zero; }
+        if (s_hVecB != IntPtr.Zero) { CuDriver.MemFreeHost(s_hVecB); s_hVecB = s_dVecB = IntPtr.Zero; }
+        if (s_hVecC != IntPtr.Zero) { CuDriver.MemFreeHost(s_hVecC); s_hVecC = s_dVecC = IntPtr.Zero; }
+
+        uint flags = CuDriver.CU_MEMHOSTALLOC_DEVICEMAP | CuDriver.CU_MEMHOSTALLOC_PORTABLE;
+        if (CuDriver.MemHostAlloc(out s_hVecA, requiredBytes, flags) != 0) return false;
+        if (CuDriver.MemHostGetDevicePointer(out s_dVecA, s_hVecA, 0) != 0) return false;
+
+        if (CuDriver.MemHostAlloc(out s_hVecB, requiredBytes, flags) != 0) return false;
+        if (CuDriver.MemHostGetDevicePointer(out s_dVecB, s_hVecB, 0) != 0) return false;
+
+        if (CuDriver.MemHostAlloc(out s_hVecC, requiredBytes, flags) != 0) return false;
+        if (CuDriver.MemHostGetDevicePointer(out s_dVecC, s_hVecC, 0) != 0) return false;
+
+        s_capVecBytes = requiredBytes;
+        return true;
+    }
+
+    /// <summary>
+    /// Executes element-wise vector addition: C = A + B.
+    /// Dispatches to the persistent GPU ring buffer when available, with sub-microsecond latency
+    /// and zero PCIe driver overhead, otherwise executes hardware SIMD.
+    /// </summary>
+    public static void VectorAdd(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> destination,
+        GpuTarget target = GpuTarget.Auto)
+    {
+        int count = a.Length;
+        if (b.Length != count || destination.Length < count)
+            throw new ArgumentException("Vector dimension mismatch.");
+
+        if (count == 0) return;
+
+        bool useGpu = target switch
+        {
+            GpuTarget.Cpu => false,
+            GpuTarget.Nvidia => true,
+            _ => count >= 256 && IsNvidiaAvailable
+        };
+
+        if (useGpu && ExecuteRingBufferVectorOp(TaskOpCode.VectorAdd, a, b, destination, 0f))
+            return;
+
+        VectorAddSimd(a, b, destination);
+    }
+
+    /// <summary>
+    /// Executes element-wise fused multiply-add: C = A * scalar + B.
+    /// Essential for gradient descent updates: W = grad * (-lr) + W.
+    /// Dispatches to the persistent GPU ring buffer when available, with sub-microsecond latency,
+    /// otherwise executes hardware SIMD.
+    /// </summary>
+    public static void VectorFma(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> destination,
+        float scalar,
+        GpuTarget target = GpuTarget.Auto)
+    {
+        int count = a.Length;
+        if (b.Length != count || destination.Length < count)
+            throw new ArgumentException("Vector dimension mismatch.");
+
+        if (count == 0) return;
+
+        bool useGpu = target switch
+        {
+            GpuTarget.Cpu => false,
+            GpuTarget.Nvidia => true,
+            _ => count >= 256 && IsNvidiaAvailable
+        };
+
+        if (useGpu && ExecuteRingBufferVectorOp(TaskOpCode.VectorFma, a, b, destination, scalar))
+            return;
+
+        VectorFmaSimd(a, b, destination, scalar);
+    }
+
+    private static bool ExecuteRingBufferVectorOp(
+        TaskOpCode opCode,
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> destination,
+        float scalar)
+    {
+        var ring = GetRingBuffer();
+        if (ring == null || s_nvidiaEngine == null) return false;
+
+        int count = a.Length;
+        nuint bytes = (nuint)(count * sizeof(float));
+
+        lock (s_initLock)
+        {
+            try
+            {
+                CuDriver.CtxSetCurrent(s_nvidiaEngine.ContextHandle);
+
+                if (!EnsureVectorBuffers(bytes))
+                    return false;
+
+                var spanA = new Span<float>((void*)s_hVecA, count);
+                var spanB = new Span<float>((void*)s_hVecB, count);
+                a.CopyTo(spanA);
+                b.CopyTo(spanB);
+
+                ring.SubmitAndWait(opCode, (uint)count, (ulong)s_dVecA, (ulong)s_dVecB, (ulong)s_dVecC, scalar);
+
+                var spanC = new ReadOnlySpan<float>((void*)s_hVecC, count);
+                spanC.CopyTo(destination);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    private static void VectorAddSimd(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> dest)
+    {
+        int length = a.Length;
+        int i = 0;
+        ref float rA = ref MemoryMarshal.GetReference(a);
+        ref float rB = ref MemoryMarshal.GetReference(b);
+        ref float rD = ref MemoryMarshal.GetReference(dest);
+
+        if (Vector512.IsHardwareAccelerated && length >= Vector512<float>.Count)
+        {
+            int step = Vector512<float>.Count;
+            int limit = length - step;
+            while (i <= limit)
+            {
+                var va = Vector512.LoadUnsafe(ref rA, (nuint)i);
+                var vb = Vector512.LoadUnsafe(ref rB, (nuint)i);
+                (va + vb).StoreUnsafe(ref rD, (nuint)i);
+                i += step;
+            }
+        }
+        else if (Vector256.IsHardwareAccelerated && length >= Vector256<float>.Count)
+        {
+            int step = Vector256<float>.Count;
+            int limit = length - step;
+            while (i <= limit)
+            {
+                var va = Vector256.LoadUnsafe(ref rA, (nuint)i);
+                var vb = Vector256.LoadUnsafe(ref rB, (nuint)i);
+                (va + vb).StoreUnsafe(ref rD, (nuint)i);
+                i += step;
+            }
+        }
+
+        for (; i < length; i++)
+        {
+            dest[i] = a[i] + b[i];
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    private static void VectorFmaSimd(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> dest, float scalar)
+    {
+        int length = a.Length;
+        int i = 0;
+        ref float rA = ref MemoryMarshal.GetReference(a);
+        ref float rB = ref MemoryMarshal.GetReference(b);
+        ref float rD = ref MemoryMarshal.GetReference(dest);
+
+        if (Vector512.IsHardwareAccelerated && length >= Vector512<float>.Count)
+        {
+            var vScalar = Vector512.Create(scalar);
+            int step = Vector512<float>.Count;
+            int limit = length - step;
+            while (i <= limit)
+            {
+                var va = Vector512.LoadUnsafe(ref rA, (nuint)i);
+                var vb = Vector512.LoadUnsafe(ref rB, (nuint)i);
+                Vector512.FusedMultiplyAdd(va, vScalar, vb).StoreUnsafe(ref rD, (nuint)i);
+                i += step;
+            }
+        }
+        else if (Vector256.IsHardwareAccelerated && length >= Vector256<float>.Count)
+        {
+            var vScalar = Vector256.Create(scalar);
+            int step = Vector256<float>.Count;
+            int limit = length - step;
+            while (i <= limit)
+            {
+                var va = Vector256.LoadUnsafe(ref rA, (nuint)i);
+                var vb = Vector256.LoadUnsafe(ref rB, (nuint)i);
+                Vector256.FusedMultiplyAdd(va, vScalar, vb).StoreUnsafe(ref rD, (nuint)i);
+                i += step;
+            }
+        }
+
+        for (; i < length; i++)
+        {
+            dest[i] = a[i] * scalar + b[i];
+        }
     }
 
     #endregion
