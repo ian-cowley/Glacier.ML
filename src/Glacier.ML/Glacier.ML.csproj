@@ -3,7 +3,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <PackageId>Glacier.ML</PackageId>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier</Company>
@@ -24,6 +24,6 @@
 
   <ItemGroup>
     <PackageReference Include="Glacier.Polaris" Version="1.0.14" />
-    <PackageReference Include="Glacier.Gpu" Version="1.0.1" />
+    <PackageReference Include="Glacier.Gpu" Version="1.0.2" />
   </ItemGroup>
 </Project>
