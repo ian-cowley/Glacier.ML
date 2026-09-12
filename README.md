@@ -135,5 +135,11 @@ dotnet run --project samples/Glacier.ML.Demo/Glacier.ML.Demo.csproj -c Release
 
 ---
 
+## Credits
+
+Developed by Ian Cowley and Antigravity (Google DeepMind).
+
+---
+
 ## 📜 License
 Licensed under the [MIT License](LICENSE). Copyright (c) 2026 Ian Cowley.
