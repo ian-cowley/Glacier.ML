@@ -55,13 +55,29 @@ public sealed class KMeans
 
         for (int c = 1; c < k; c++)
         {
-            ReadOnlySpan<float> lastCentroid = _centroids.AsSpan((c - 1) * cols, cols);
-            double sumDist = 0;
+            int centroidOffset = (c - 1) * cols;
 
+            if (rows >= 1024)
+            {
+                Parallel.For(0, rows, r =>
+                {
+                    float d = KMeansKernels.EuclideanDistanceSquared(features.GetRow(r), _centroids.AsSpan(centroidOffset, cols));
+                    if (d < minDistances[r]) minDistances[r] = d;
+                });
+            }
+            else
+            {
+                ReadOnlySpan<float> lastCentroid = _centroids.AsSpan(centroidOffset, cols);
+                for (int r = 0; r < rows; r++)
+                {
+                    float d = KMeansKernels.EuclideanDistanceSquared(features.GetRow(r), lastCentroid);
+                    if (d < minDistances[r]) minDistances[r] = d;
+                }
+            }
+
+            double sumDist = 0;
             for (int r = 0; r < rows; r++)
             {
-                float d = KMeansKernels.EuclideanDistanceSquared(features.GetRow(r), lastCentroid);
-                if (d < minDistances[r]) minDistances[r] = d;
                 sumDist += minDistances[r];
             }
 
@@ -88,6 +104,15 @@ public sealed class KMeans
         float[] newCentroids = new float[k * cols];
         int[] clusterCounts = new int[k];
 
+        int numThreads = Math.Min(Environment.ProcessorCount, Math.Max(1, rows / 512));
+        float[][] threadCentroids = new float[numThreads][];
+        int[][] threadCounts = new int[numThreads][];
+        for (int t = 0; t < numThreads; t++)
+        {
+            threadCentroids[t] = new float[k * cols];
+            threadCounts[t] = new int[k];
+        }
+
         for (int iter = 0; iter < _maxIterations; iter++)
         {
             Array.Clear(newCentroids);
@@ -103,16 +128,59 @@ public sealed class KMeans
                 });
             }
 
-            // M-step: Recompute centroids
-            for (int r = 0; r < rows; r++)
+            // M-step: Recompute centroids in parallel with thread-local buffers
+            if (numThreads > 1)
             {
-                int cluster = assignments[r];
-                clusterCounts[cluster]++;
-                int offset = cluster * cols;
-                ReadOnlySpan<float> row = features.GetRow(r);
-                for (int d = 0; d < cols; d++)
+                Parallel.For(0, numThreads, t =>
                 {
-                    newCentroids[offset + d] += row[d];
+                    Array.Clear(threadCentroids[t]);
+                    Array.Clear(threadCounts[t]);
+
+                    int startRow = t * rows / numThreads;
+                    int endRow = (t == numThreads - 1) ? rows : (t + 1) * rows / numThreads;
+
+                    float[] localCentroids = threadCentroids[t];
+                    int[] localCounts = threadCounts[t];
+
+                    for (int r = startRow; r < endRow; r++)
+                    {
+                        int cluster = assignments[r];
+                        localCounts[cluster]++;
+                        int offset = cluster * cols;
+                        ReadOnlySpan<float> row = features.GetRow(r);
+                        for (int d = 0; d < cols; d++)
+                        {
+                            localCentroids[offset + d] += row[d];
+                        }
+                    }
+                });
+
+                for (int t = 0; t < numThreads; t++)
+                {
+                    float[] tCent = threadCentroids[t];
+                    int[] tCnt = threadCounts[t];
+                    for (int c = 0; c < k; c++)
+                    {
+                        clusterCounts[c] += tCnt[c];
+                    }
+                    for (int i = 0; i < k * cols; i++)
+                    {
+                        newCentroids[i] += tCent[i];
+                    }
+                }
+            }
+            else
+            {
+                for (int r = 0; r < rows; r++)
+                {
+                    int cluster = assignments[r];
+                    clusterCounts[cluster]++;
+                    int offset = cluster * cols;
+                    ReadOnlySpan<float> row = features.GetRow(r);
+                    for (int d = 0; d < cols; d++)
+                    {
+                        newCentroids[offset + d] += row[d];
+                    }
                 }
             }
 

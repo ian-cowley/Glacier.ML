@@ -91,4 +91,71 @@ public class KMeansTests
         Assert.Equal(c1, kmeans.PredictRow(query1));
         Assert.Equal(c2, kmeans.PredictRow(query2));
     }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(16)]
+    public void KMeansKernels_FindNearestCentroid_MatchesScalar(int dim)
+    {
+        int k = 4;
+        float[] centroids = new float[k * dim];
+        var rng = new Random(123);
+        for (int i = 0; i < centroids.Length; i++) centroids[i] = (float)rng.NextDouble() * 10f;
+
+        float[] sample = new float[dim];
+        for (int i = 0; i < dim; i++) sample[i] = (float)rng.NextDouble() * 10f;
+
+        int nearest = KMeansKernels.FindNearestCentroid(sample, centroids, k, dim);
+
+        // Compute expected via scalar reference
+        int expectedCluster = 0;
+        float minD = float.MaxValue;
+        for (int c = 0; c < k; c++)
+        {
+            float d = 0f;
+            for (int j = 0; j < dim; j++)
+            {
+                float diff = sample[j] - centroids[c * dim + j];
+                d += diff * diff;
+            }
+            if (d < minD)
+            {
+                minD = d;
+                expectedCluster = c;
+            }
+        }
+
+        Assert.Equal(expectedCluster, nearest);
+    }
+
+    [Fact]
+    public void KMeans_MultiThreadedMStep_RunsCorrectlyOnLargeDataset()
+    {
+        const int rows = 5000;
+        const int cols = 8;
+        const int k = 4;
+
+        var matrix = new FeatureMatrix(rows, cols);
+        var rng = new Random(42);
+        for (int r = 0; r < rows; r++)
+        {
+            for (int c = 0; c < cols; c++)
+            {
+                matrix.SetValue(r, c, (float)rng.NextDouble() * 100f);
+            }
+        }
+
+        var kmeans = new KMeans(k: k, maxIterations: 10);
+        kmeans.Fit(matrix);
+
+        int[] assignments = new int[rows];
+        kmeans.Predict(matrix, assignments);
+
+        for (int r = 0; r < rows; r++)
+        {
+            Assert.InRange(assignments[r], 0, k - 1);
+        }
+    }
 }
