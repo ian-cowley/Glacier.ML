@@ -1,3 +1,5 @@
+![Glacier.ML Banner](assets/banner.jpg)
+
 # 🧠 Glacier.ML
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
