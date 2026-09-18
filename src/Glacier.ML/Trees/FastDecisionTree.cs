@@ -38,7 +38,7 @@ public sealed class FastDecisionTree : IPredictor
         int[] sampleIndices = new int[numRows];
         for (int i = 0; i < numRows; i++) sampleIndices[i] = i;
 
-        var nodeList = new List<DecisionTreeNode>();
+        var nodeList = new List<DecisionTreeNode>(128);
 
         // Pre-extract columns for faster memory cache access
         float[][] colData = new float[numCols][];
@@ -48,24 +48,27 @@ public sealed class FastDecisionTree : IPredictor
             features.CopyColumn(c, colData[c]);
         }
 
-        BuildTreeRecursive(nodeList, colData, targets, sampleIndices, 0);
+        BuildTreeInPlace(nodeList, colData, targets, activeFeatures, sampleIndices, 0, numRows, 0);
         _nodes = nodeList.ToArray();
     }
 
-    private int BuildTreeRecursive(
+    private int BuildTreeInPlace(
         List<DecisionTreeNode> nodeList,
         float[][] colData,
         ReadOnlySpan<float> targets,
+        int[] activeFeatures,
         int[] samples,
+        int offset,
+        int count,
         int currentDepth)
     {
-        int count = samples.Length;
+        ReadOnlySpan<int> sampleSlice = samples.AsSpan(offset, count);
 
         // Calculate majority class / mean target
         int posCount = 0;
         for (int i = 0; i < count; i++)
         {
-            if (targets[samples[i]] > 0.5f) posCount++;
+            if (targets[sampleSlice[i]] > 0.5f) posCount++;
         }
         float leafVal = (posCount >= (count - posCount)) ? 1.0f : 0.0f;
 
@@ -82,9 +85,10 @@ public sealed class FastDecisionTree : IPredictor
         float bestThreshold = 0f;
         float bestGain = 0f;
 
-        for (int f = 0; f < colData.Length; f++)
+        for (int fi = 0; fi < activeFeatures.Length; fi++)
         {
-            var (threshold, gain) = SplitFinder.FindBestSplitClassification(colData[f], targets, samples);
+            int f = activeFeatures[fi];
+            var (threshold, gain) = SplitFinder.FindBestSplitClassification(colData[f], targets, sampleSlice);
             if (gain > bestGain)
             {
                 bestGain = gain;
@@ -100,21 +104,28 @@ public sealed class FastDecisionTree : IPredictor
             return leafIdx;
         }
 
-        // Partition samples into left and right
-        var leftSamples = new List<int>(count / 2);
-        var rightSamples = new List<int>(count / 2);
-
+        // ZERO ALLOCATION: In-place two-pointer Hoare partition within samples[offset .. offset + count]
         float[] bestCol = colData[bestFeature];
-        for (int i = 0; i < count; i++)
+        int left = offset;
+        int right = offset + count - 1;
+
+        while (left <= right)
         {
-            int idx = samples[i];
-            if (bestCol[idx] <= bestThreshold)
-                leftSamples.Add(idx);
+            if (bestCol[samples[left]] <= bestThreshold)
+            {
+                left++;
+            }
             else
-                rightSamples.Add(idx);
+            {
+                (samples[left], samples[right]) = (samples[right], samples[left]);
+                right--;
+            }
         }
 
-        if (leftSamples.Count == 0 || rightSamples.Count == 0)
+        int leftCount = left - offset;
+        int rightCount = count - leftCount;
+
+        if (leftCount == 0 || rightCount == 0)
         {
             int leafIdx = nodeList.Count;
             nodeList.Add(DecisionTreeNode.CreateLeaf(leafVal));
@@ -125,8 +136,8 @@ public sealed class FastDecisionTree : IPredictor
         int nodeIdx = nodeList.Count;
         nodeList.Add(default); // Placeholder
 
-        int leftChild = BuildTreeRecursive(nodeList, colData, targets, leftSamples.ToArray(), currentDepth + 1);
-        int rightChild = BuildTreeRecursive(nodeList, colData, targets, rightSamples.ToArray(), currentDepth + 1);
+        int leftChild = BuildTreeInPlace(nodeList, colData, targets, activeFeatures, samples, offset, leftCount, currentDepth + 1);
+        int rightChild = BuildTreeInPlace(nodeList, colData, targets, activeFeatures, samples, left, rightCount, currentDepth + 1);
 
         nodeList[nodeIdx] = DecisionTreeNode.CreateBranch(bestFeature, bestThreshold, leftChild, rightChild);
         return nodeIdx;

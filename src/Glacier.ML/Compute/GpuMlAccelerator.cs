@@ -21,6 +21,20 @@ namespace Glacier.ML.Compute;
 public static unsafe class GpuMlAccelerator
 {
     private static readonly Lock s_initLock = new();
+    private static readonly Lock s_ringBufferLock = new();
+    private static readonly System.Collections.Concurrent.ConcurrentQueue<GpuMlStreamContext> s_streamPool = new();
+
+    private static GpuMlStreamContext RentContext()
+    {
+        if (s_streamPool.TryDequeue(out var ctx))
+            return ctx;
+        return new GpuMlStreamContext();
+    }
+
+    private static void ReturnContext(GpuMlStreamContext ctx)
+    {
+        s_streamPool.Enqueue(ctx);
+    }
     private static bool s_nvidiaInitialized;
     private static bool s_nvidiaAvailable;
     private static IntPtr s_cuContext;
@@ -28,13 +42,6 @@ public static unsafe class GpuMlAccelerator
     private static IntPtr s_fnKMeansAssign;
     private static IntPtr s_fnSigmoid;
 
-    // Persistent pooled device buffers for K-Means (eliminates allocator overhead)
-    private static IntPtr s_dSamples;
-    private static IntPtr s_dCentroids;
-    private static IntPtr s_dAssignments;
-    private static nuint s_capSamples;
-    private static nuint s_capCentroids;
-    private static nuint s_capAssignments;
 
     // Persistent Megakernel Ring Buffer engine & unified device-mapped memory
     private static NvidiaSassEngine? s_nvidiaEngine;
@@ -232,56 +239,36 @@ public static unsafe class GpuMlAccelerator
         nuint bytesCentroids = (nuint)(k * d * sizeof(float));
         nuint bytesAssignments = (nuint)(n * sizeof(int));
 
-        CuDriver.CtxSetCurrent(s_cuContext);
-
-        lock (s_initLock)
+        GpuMlStreamContext ctx = RentContext();
+        try
         {
-            if (bytesSamples > s_capSamples)
-            {
-                if (s_dSamples != IntPtr.Zero) CuDriver.MemFree(s_dSamples);
-                if (CuDriver.MemAlloc(out s_dSamples, bytesSamples) != 0) return false;
-                s_capSamples = bytesSamples;
-            }
-
-            if (bytesCentroids > s_capCentroids)
-            {
-                if (s_dCentroids != IntPtr.Zero) CuDriver.MemFree(s_dCentroids);
-                if (CuDriver.MemAlloc(out s_dCentroids, bytesCentroids) != 0) return false;
-                s_capCentroids = bytesCentroids;
-            }
-
-            if (bytesAssignments > s_capAssignments)
-            {
-                if (s_dAssignments != IntPtr.Zero) CuDriver.MemFree(s_dAssignments);
-                if (CuDriver.MemAlloc(out s_dAssignments, bytesAssignments) != 0) return false;
-                s_capAssignments = bytesAssignments;
-            }
+            CuDriver.CtxSetCurrent(s_cuContext);
+            ctx.EnsureCapacity(bytesSamples, bytesCentroids, bytesAssignments);
 
             fixed (float* pSamples = samples)
             fixed (float* pCentroids = centroids)
             fixed (int* pAssignments = assignments)
             {
-                CuDriver.MemcpyHtoD(s_dSamples, (IntPtr)pSamples, bytesSamples);
-                CuDriver.MemcpyHtoD(s_dCentroids, (IntPtr)pCentroids, bytesCentroids);
+                CuDriver.MemcpyHtoDAsync(ctx.DeviceSamples, (IntPtr)pSamples, bytesSamples, ctx.Stream);
+                CuDriver.MemcpyHtoDAsync(ctx.DeviceCentroids, (IntPtr)pCentroids, bytesCentroids, ctx.Stream);
 
-                IntPtr[] kernelParams = new IntPtr[6];
-                GCHandle h0 = GCHandle.Alloc(s_dSamples, GCHandleType.Pinned);
-                GCHandle h1 = GCHandle.Alloc(s_dCentroids, GCHandleType.Pinned);
-                GCHandle h2 = GCHandle.Alloc(s_dAssignments, GCHandleType.Pinned);
-                GCHandle h3 = GCHandle.Alloc(n, GCHandleType.Pinned);
-                GCHandle h4 = GCHandle.Alloc(k, GCHandleType.Pinned);
-                GCHandle h5 = GCHandle.Alloc(d, GCHandleType.Pinned);
+                IntPtr argSamples = ctx.DeviceSamples;
+                IntPtr argCentroids = ctx.DeviceCentroids;
+                IntPtr argAssignments = ctx.DeviceAssignments;
+                int argN = n;
+                int argK = k;
+                int argD = d;
 
-                kernelParams[0] = h0.AddrOfPinnedObject();
-                kernelParams[1] = h1.AddrOfPinnedObject();
-                kernelParams[2] = h2.AddrOfPinnedObject();
-                kernelParams[3] = h3.AddrOfPinnedObject();
-                kernelParams[4] = h4.AddrOfPinnedObject();
-                kernelParams[5] = h5.AddrOfPinnedObject();
+                void* pArgSamples = &argSamples;
+                void* pArgCentroids = &argCentroids;
+                void* pArgAssignments = &argAssignments;
+                void* pArgN = &argN;
+                void* pArgK = &argK;
+                void* pArgD = &argD;
 
-                GCHandle hArray = GCHandle.Alloc(kernelParams, GCHandleType.Pinned);
+                void*[] kernelParams = [pArgSamples, pArgCentroids, pArgAssignments, pArgN, pArgK, pArgD];
 
-                try
+                fixed (void* pKernelParams = kernelParams)
                 {
                     uint blockSize = 256;
                     uint gridSize = (uint)((n + 255) / 256);
@@ -290,27 +277,25 @@ public static unsafe class GpuMlAccelerator
                         s_fnKMeansAssign,
                         gridSize, 1, 1,
                         blockSize, 1, 1,
-                        0, IntPtr.Zero,
-                        hArray.AddrOfPinnedObject(),
+                        0, ctx.Stream,
+                        (IntPtr)pKernelParams,
                         IntPtr.Zero);
 
                     if (launchRes != 0) return false;
 
-                    CuDriver.CtxSynchronize();
-                    CuDriver.MemcpyDtoH((IntPtr)pAssignments, s_dAssignments, bytesAssignments);
+                    CuDriver.MemcpyDtoHAsync((IntPtr)pAssignments, ctx.DeviceAssignments, bytesAssignments, ctx.Stream);
+                    CuDriver.StreamSynchronize(ctx.Stream);
                     return true;
                 }
-                finally
-                {
-                    hArray.Free();
-                    h0.Free();
-                    h1.Free();
-                    h2.Free();
-                    h3.Free();
-                    h4.Free();
-                    h5.Free();
-                }
             }
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            ReturnContext(ctx);
         }
     }
 
@@ -610,7 +595,7 @@ public static unsafe class GpuMlAccelerator
         int count = a.Length;
         nuint bytes = (nuint)(count * sizeof(float));
 
-        lock (s_initLock)
+        lock (s_ringBufferLock)
         {
             try
             {
@@ -720,4 +705,67 @@ public static unsafe class GpuMlAccelerator
     }
 
     #endregion
+}
+
+/// <summary>
+/// Thread-safe, lock-free per-stream device execution context for GPU ML offload.
+/// Each context owns its own dedicated CUDA stream and pre-allocated device memory slab.
+/// </summary>
+public sealed class GpuMlStreamContext : IDisposable
+{
+    public IntPtr Stream { get; }
+    public IntPtr DeviceSamples { get; private set; }
+    public IntPtr DeviceCentroids { get; private set; }
+    public IntPtr DeviceAssignments { get; private set; }
+
+    public nuint CapSamples { get; private set; }
+    public nuint CapCentroids { get; private set; }
+    public nuint CapAssignments { get; private set; }
+
+    private bool _disposed;
+
+    public GpuMlStreamContext()
+    {
+        CuDriver.StreamCreate(out IntPtr stream, 0);
+        Stream = stream;
+    }
+
+    public void EnsureCapacity(nuint bytesSamples, nuint bytesCentroids, nuint bytesAssignments)
+    {
+        if (bytesSamples > CapSamples)
+        {
+            if (DeviceSamples != IntPtr.Zero) CuDriver.MemFree(DeviceSamples);
+            CuDriver.MemAlloc(out IntPtr dS, bytesSamples);
+            DeviceSamples = dS;
+            CapSamples = bytesSamples;
+        }
+
+        if (bytesCentroids > CapCentroids)
+        {
+            if (DeviceCentroids != IntPtr.Zero) CuDriver.MemFree(DeviceCentroids);
+            CuDriver.MemAlloc(out IntPtr dC, bytesCentroids);
+            DeviceCentroids = dC;
+            CapCentroids = bytesCentroids;
+        }
+
+        if (bytesAssignments > CapAssignments)
+        {
+            if (DeviceAssignments != IntPtr.Zero) CuDriver.MemFree(DeviceAssignments);
+            CuDriver.MemAlloc(out IntPtr dA, bytesAssignments);
+            DeviceAssignments = dA;
+            CapAssignments = bytesAssignments;
+        }
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            _disposed = true;
+            if (DeviceSamples != IntPtr.Zero) CuDriver.MemFree(DeviceSamples);
+            if (DeviceCentroids != IntPtr.Zero) CuDriver.MemFree(DeviceCentroids);
+            if (DeviceAssignments != IntPtr.Zero) CuDriver.MemFree(DeviceAssignments);
+            if (Stream != IntPtr.Zero) CuDriver.StreamDestroy(Stream);
+        }
+    }
 }

@@ -65,4 +65,44 @@ public class DecisionTreeTests
             Assert.Equal(targets[i], preds[i]);
         }
     }
+
+    [Fact]
+    public void DecisionTree_InPlacePartitioning_MultiFeatureAndSubsets_Correct()
+    {
+        const int n = 500;
+        const int cols = 5;
+        var matrix = new FeatureMatrix(n, cols);
+        float[] targets = new float[n];
+
+        var rng = new Random(999);
+        for (int i = 0; i < n; i++)
+        {
+            for (int c = 0; c < cols; c++)
+            {
+                matrix.SetValue(i, c, (float)rng.NextDouble() * 100f);
+            }
+            // Class depends on feature 2 and feature 4
+            float f2 = matrix.GetValue(i, 2);
+            float f4 = matrix.GetValue(i, 4);
+            targets[i] = (f2 > 50f && f4 < 70f) ? 1.0f : 0.0f;
+        }
+
+        var treeAll = new FastDecisionTree(maxDepth: 6, minSamplesSplit: 4);
+        treeAll.Fit(matrix, targets);
+
+        float[] predsAll = new float[n];
+        treeAll.Predict(matrix, predsAll);
+        float accAll = Metrics.Accuracy(targets, predsAll);
+        Assert.True(accAll >= 0.90f, $"Expected high accuracy, got {accAll}");
+
+        // Test with explicit feature subset (only features 2 and 4 active)
+        int[] activeSubset = [2, 4];
+        var treeSubset = new FastDecisionTree(maxDepth: 6, minSamplesSplit: 4);
+        treeSubset.Fit(matrix, targets, activeSubset);
+
+        float[] predsSubset = new float[n];
+        treeSubset.Predict(matrix, predsSubset);
+        float accSubset = Metrics.Accuracy(targets, predsSubset);
+        Assert.True(accSubset >= 0.90f, $"Expected high accuracy on subset, got {accSubset}");
+    }
 }
