@@ -151,6 +151,14 @@ dotnet run --project samples/Glacier.ML.Demo/Glacier.ML.Demo.csproj -c Release
 
 ---
 
+## 🆕 What's New in v1.0.3
+
+- **`GpuMlStreamContext` pool** — per-thread GPU memory reuse, eliminating repeated allocation/deallocation cycles in tight training loops.
+- **Zero-alloc in-place Hoare partition tree split** — removes all recursive stack allocation in the decision tree splitting path, enabling deeper trees without stack overflow risk.
+- **35 tests** passing (100 %).
+
+---
+
 ## Credits
 
 Developed by Ian Cowley and Antigravity (Google DeepMind).
