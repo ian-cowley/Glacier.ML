@@ -12,6 +12,8 @@ public class AdversarialMlTests
     [Fact]
     public void GpuMlStreamContext_ConcurrentMultiThreadedStressTest()
     {
+        if (!GpuMlAccelerator.IsNvidiaAvailable) return;
+
         // Concurrently rent, resize, and return stream contexts across 32 threads
         const int numTasks = 32;
         const int iterationsPerTask = 25;
