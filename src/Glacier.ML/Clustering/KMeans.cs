@@ -37,6 +37,12 @@ public sealed class KMeans
 
     public void Fit(FeatureMatrix features)
     {
+        if (features.IsColumnar)
+        {
+            FitColumnar(features);
+            return;
+        }
+
         int rows = features.Rows;
         int cols = features.Columns;
         _dimensions = cols;
@@ -220,6 +226,40 @@ public sealed class KMeans
         int cols = features.Columns;
         int k = Math.Min(_k, rows);
 
+        if (features.IsColumnar)
+        {
+            unsafe
+            {
+                fixed (int* pAssign = clusterAssignments)
+                {
+                    nint assignAddr = (nint)pAssign;
+                    Parallel.For(0, rows, r =>
+                    {
+                        int* pOut = (int*)assignAddr;
+                        float minD = float.MaxValue;
+                        int bestC = 0;
+                        for (int c = 0; c < k; c++)
+                        {
+                            int offset = c * cols;
+                            float d = 0f;
+                            for (int dim = 0; dim < cols; dim++)
+                            {
+                                float diff = features.GetColumn(dim)[r] - _centroids[offset + dim];
+                                d += diff * diff;
+                            }
+                            if (d < minD)
+                            {
+                                minD = d;
+                                bestC = c;
+                            }
+                        }
+                        pOut[r] = bestC;
+                    });
+                }
+            }
+            return;
+        }
+
         if (GpuMlAccelerator.AssignClustersGpu(features.Span, _centroids, clusterAssignments, rows, k, cols, target))
         {
             return;
@@ -237,6 +277,187 @@ public sealed class KMeans
                     pAssign[r] = KMeansKernels.FindNearestCentroid(pRow, pCent, k, cols);
                 }
             }
+        }
+    }
+
+    private void FitColumnar(FeatureMatrix features)
+    {
+        int rows = features.Rows;
+        int cols = features.Columns;
+        _dimensions = cols;
+        int k = Math.Min(_k, rows);
+
+        _centroids = new float[k * cols];
+        var rng = new Random(42);
+
+        // k-means++ initialization directly on columnar data
+        int firstIdx = rng.Next(0, rows);
+        for (int d = 0; d < cols; d++)
+        {
+            _centroids[d] = features.GetColumn(d)[firstIdx];
+        }
+
+        float[] minDistances = new float[rows];
+        Array.Fill(minDistances, float.MaxValue);
+
+        for (int c = 1; c < k; c++)
+        {
+            int centroidOffset = (c - 1) * cols;
+
+            Parallel.For(0, rows, r =>
+            {
+                float d = 0f;
+                for (int dim = 0; dim < cols; dim++)
+                {
+                    float diff = features.GetColumn(dim)[r] - _centroids[centroidOffset + dim];
+                    d += diff * diff;
+                }
+                if (d < minDistances[r]) minDistances[r] = d;
+            });
+
+            double sumDist = 0;
+            for (int r = 0; r < rows; r++)
+            {
+                sumDist += minDistances[r];
+            }
+
+            double target = rng.NextDouble() * sumDist;
+            double cumulative = 0;
+            int chosenIdx = rows - 1;
+
+            for (int r = 0; r < rows; r++)
+            {
+                cumulative += minDistances[r];
+                if (cumulative >= target)
+                {
+                    chosenIdx = r;
+                    break;
+                }
+            }
+
+            int nextOffset = c * cols;
+            for (int d = 0; d < cols; d++)
+            {
+                _centroids[nextOffset + d] = features.GetColumn(d)[chosenIdx];
+            }
+        }
+
+        // Iterative optimization loop
+        int[] assignments = new int[rows];
+        float[] newCentroids = new float[k * cols];
+        int[] clusterCounts = new int[k];
+
+        int numThreads = Math.Min(Environment.ProcessorCount, Math.Max(1, rows / 512));
+        float[][] threadCentroids = new float[numThreads][];
+        int[][] threadCounts = new int[numThreads][];
+        for (int t = 0; t < numThreads; t++)
+        {
+            threadCentroids[t] = new float[k * cols];
+            threadCounts[t] = new int[k];
+        }
+
+        for (int iter = 0; iter < _maxIterations; iter++)
+        {
+            Array.Clear(newCentroids);
+            Array.Clear(clusterCounts);
+
+            // E-step: Assign points to nearest centroid directly over column spans
+            Parallel.For(0, rows, r =>
+            {
+                float minD = float.MaxValue;
+                int bestC = 0;
+                for (int c = 0; c < k; c++)
+                {
+                    int offset = c * cols;
+                    float d = 0f;
+                    for (int dim = 0; dim < cols; dim++)
+                    {
+                        float diff = features.GetColumn(dim)[r] - _centroids[offset + dim];
+                        d += diff * diff;
+                    }
+                    if (d < minD)
+                    {
+                        minD = d;
+                        bestC = c;
+                    }
+                }
+                assignments[r] = bestC;
+            });
+
+            // M-step: Recompute centroids in parallel with thread-local buffers
+            if (numThreads > 1)
+            {
+                Parallel.For(0, numThreads, t =>
+                {
+                    Array.Clear(threadCentroids[t]);
+                    Array.Clear(threadCounts[t]);
+
+                    int startRow = t * rows / numThreads;
+                    int endRow = (t == numThreads - 1) ? rows : (t + 1) * rows / numThreads;
+
+                    float[] localCentroids = threadCentroids[t];
+                    int[] localCounts = threadCounts[t];
+
+                    for (int r = startRow; r < endRow; r++)
+                    {
+                        int cluster = assignments[r];
+                        localCounts[cluster]++;
+                        int offset = cluster * cols;
+                        for (int d = 0; d < cols; d++)
+                        {
+                            localCentroids[offset + d] += features.GetColumn(d)[r];
+                        }
+                    }
+                });
+
+                for (int t = 0; t < numThreads; t++)
+                {
+                    float[] tCent = threadCentroids[t];
+                    int[] tCnt = threadCounts[t];
+                    for (int c = 0; c < k; c++)
+                    {
+                        clusterCounts[c] += tCnt[c];
+                    }
+                    for (int i = 0; i < k * cols; i++)
+                    {
+                        newCentroids[i] += tCent[i];
+                    }
+                }
+            }
+            else
+            {
+                for (int r = 0; r < rows; r++)
+                {
+                    int cluster = assignments[r];
+                    clusterCounts[cluster]++;
+                    int offset = cluster * cols;
+                    for (int d = 0; d < cols; d++)
+                    {
+                        newCentroids[offset + d] += features.GetColumn(d)[r];
+                    }
+                }
+            }
+
+            float maxShift = 0f;
+            for (int c = 0; c < k; c++)
+            {
+                int count = Math.Max(1, clusterCounts[c]);
+                int offset = c * cols;
+                float shift = 0f;
+
+                for (int d = 0; d < cols; d++)
+                {
+                    float updated = newCentroids[offset + d] / count;
+                    float diff = updated - _centroids[offset + d];
+                    shift += diff * diff;
+                    _centroids[offset + d] = updated;
+                }
+
+                if (shift > maxShift) maxShift = shift;
+            }
+
+            if (maxShift < _tolerance)
+                break; // Converged
         }
     }
 

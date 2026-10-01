@@ -34,49 +34,59 @@ public sealed class FastRandomForest : IPredictor
         _subsampleRatio = Math.Clamp(subsampleRatio, 0.1f, 1.0f);
     }
 
-    public void Fit(FeatureMatrix features, ReadOnlySpan<float> targets)
+    public unsafe void Fit(FeatureMatrix features, ReadOnlySpan<float> targets)
     {
         int totalRows = features.Rows;
         int totalCols = features.Columns;
         int sampleSize = Math.Max(2, (int)(totalRows * _subsampleRatio));
 
         _trees = new FastDecisionTree[_numTrees];
-        float[] targetsArray = targets.ToArray();
 
-        // Fit trees in parallel across all CPU cores
-        Parallel.For(0, _numTrees, t =>
+        fixed (float* pTargets = targets)
         {
-            var rng = new Random(42 + t * 31);
-
-            // Bootstrap row sampling
-            int[] bootstrapIndices = new int[sampleSize];
-            float[] sampleTargets = new float[sampleSize];
-            var sampleMatrix = new FeatureMatrix(sampleSize, totalCols);
-
-            for (int s = 0; s < sampleSize; s++)
+            nint targetsPtr = (nint)pTargets;
+            // Fit trees in parallel across all CPU cores with zero heap array copies
+            Parallel.For(0, _numTrees, t =>
             {
-                int r = rng.Next(0, totalRows);
-                bootstrapIndices[s] = r;
-                sampleTargets[s] = targetsArray[r];
-                for (int c = 0; c < totalCols; c++)
-                {
-                    sampleMatrix.SetValue(s, c, features.GetValue(r, c));
-                }
-            }
+                var rng = new Random(42 + t * 31);
 
-            var tree = new FastDecisionTree(_maxDepth, _minSamplesSplit);
-            tree.Fit(sampleMatrix, sampleTargets);
-            _trees[t] = tree;
-        });
+                // Bootstrap row sampling indices only - zero feature data copies
+                int[] bootstrapIndices = new int[sampleSize];
+                for (int s = 0; s < sampleSize; s++)
+                {
+                    bootstrapIndices[s] = rng.Next(0, totalRows);
+                }
+
+                var tree = new FastDecisionTree(_maxDepth, _minSamplesSplit);
+                var targetsSpan = new ReadOnlySpan<float>((float*)targetsPtr, totalRows);
+                tree.Fit(features, targetsSpan, sampleIndices: bootstrapIndices);
+                _trees[t] = tree;
+            });
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Predict(FeatureMatrix features, Span<float> predictions)
     {
         int rows = features.Rows;
-        for (int r = 0; r < rows; r++)
+        if (features.IsColumnar)
         {
-            predictions[r] = PredictRow(features.GetRow(r));
+            for (int r = 0; r < rows; r++)
+            {
+                float sum = 0f;
+                for (int t = 0; t < _trees.Length; t++)
+                {
+                    sum += _trees[t].PredictRowColumnar(features, r);
+                }
+                predictions[r] = (sum / _trees.Length) >= 0.5f ? 1.0f : 0.0f;
+            }
+        }
+        else
+        {
+            for (int r = 0; r < rows; r++)
+            {
+                predictions[r] = PredictRow(features.GetRow(r));
+            }
         }
     }
 
