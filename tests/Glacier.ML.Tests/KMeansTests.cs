@@ -158,4 +158,190 @@ public class KMeansTests
             Assert.InRange(assignments[r], 0, k - 1);
         }
     }
+
+    [Theory]
+    [InlineData(2, 50)]
+    [InlineData(3, 50)]
+    [InlineData(4, 100)]
+    [InlineData(8, 200)]
+    [InlineData(10, 300)]
+    [InlineData(16, 400)]
+    [InlineData(20, 600)]
+    [InlineData(32, 1000)]
+    public void PredictBatchDecomposed_MatchesFindNearestCentroid_AcrossDimensions(int dim, int numSamples)
+    {
+        const int k = 5;
+        var rng = new Random(42 + dim);
+
+        float[] centroids = new float[k * dim];
+        for (int i = 0; i < centroids.Length; i++) centroids[i] = (float)rng.NextDouble() * 100f;
+
+        float[] centroidNormsSq = new float[k];
+        for (int c = 0; c < k; c++)
+        {
+            float norm = 0f;
+            for (int d = 0; d < dim; d++)
+            {
+                float val = centroids[c * dim + d];
+                norm += val * val;
+            }
+            centroidNormsSq[c] = norm;
+        }
+
+        float[] data = new float[numSamples * dim];
+        for (int i = 0; i < data.Length; i++) data[i] = (float)rng.NextDouble() * 100f;
+
+        int[] expectedAssignments = new int[numSamples];
+        int[] actualAssignments = new int[numSamples];
+
+        // Scalar reference via FindNearestCentroid
+        for (int r = 0; r < numSamples; r++)
+        {
+            var rowSpan = data.AsSpan(r * dim, dim);
+            expectedAssignments[r] = KMeansKernels.FindNearestCentroid(rowSpan, centroids, k, dim);
+        }
+
+        // Vectorized batch decomposed
+        KMeansKernels.PredictBatchDecomposed(
+            data,
+            centroids,
+            centroidNormsSq,
+            0,
+            numSamples,
+            dim,
+            k,
+            actualAssignments);
+
+        for (int r = 0; r < numSamples; r++)
+        {
+            Assert.Equal(expectedAssignments[r], actualAssignments[r]);
+        }
+    }
+
+    [Fact]
+    public void KMeans_CentroidNormsSq_CalculatedCorrectly()
+    {
+        const int rows = 200;
+        const int cols = 6;
+        const int k = 3;
+
+        var matrix = new FeatureMatrix(rows, cols);
+        var rng = new Random(789);
+        for (int r = 0; r < rows; r++)
+        {
+            for (int c = 0; c < cols; c++)
+            {
+                matrix.SetValue(r, c, (float)rng.NextDouble() * 10f);
+            }
+        }
+
+        var kmeans = new KMeans(k: k, maxIterations: 15);
+        kmeans.Fit(matrix);
+
+        Assert.Equal(k, kmeans.CentroidNormsSq.Length);
+        for (int c = 0; c < k; c++)
+        {
+            float expectedNorm = 0f;
+            int offset = c * cols;
+            for (int d = 0; d < cols; d++)
+            {
+                float val = kmeans.Centroids[offset + d];
+                expectedNorm += val * val;
+            }
+            Assert.Equal(expectedNorm, kmeans.CentroidNormsSq[c], precision: 3);
+        }
+    }
+
+    [Fact]
+    public void KMeans_Predict_SmallAndLargeBatches_ProducesConsistentResults()
+    {
+        const int rows = 1200;
+        const int cols = 8;
+        const int k = 4;
+
+        var trainMatrix = new FeatureMatrix(rows, cols);
+        var rng = new Random(999);
+        for (int r = 0; r < rows; r++)
+        {
+            for (int c = 0; c < cols; c++)
+            {
+                trainMatrix.SetValue(r, c, (float)rng.NextDouble() * 50f);
+            }
+        }
+
+        var kmeans = new KMeans(k: k, maxIterations: 10);
+        kmeans.Fit(trainMatrix);
+
+        // Test small batch (100 rows, < 512)
+        var smallMatrix = new FeatureMatrix(100, cols);
+        for (int r = 0; r < 100; r++)
+        {
+            for (int c = 0; c < cols; c++)
+            {
+                smallMatrix.SetValue(r, c, trainMatrix.GetValue(r, c));
+            }
+        }
+        int[] smallAssignments = new int[100];
+        kmeans.Predict(smallMatrix, smallAssignments);
+
+        // Test full batch (1200 rows, >= 512, parallel path)
+        int[] largeAssignments = new int[rows];
+        kmeans.Predict(trainMatrix, largeAssignments);
+
+        // First 100 rows must match exactly between small and large batch predictions
+        for (int r = 0; r < 100; r++)
+        {
+            Assert.Equal(smallAssignments[r], largeAssignments[r]);
+        }
+    }
+
+    [Fact]
+    public void KMeans_Predict_50k_Samples_HighThroughput()
+    {
+        const int nSamples = 50_000;
+        const int nFeatures = 10;
+        const int k = 5;
+
+        using var matrix = new FeatureMatrix(nSamples, nFeatures);
+        var rng = new Random(42);
+        for (int i = 0; i < nSamples; i++)
+        {
+            for (int c = 0; c < nFeatures; c++)
+            {
+                matrix.SetValue(i, c, (float)rng.NextDouble() * 10f);
+            }
+        }
+
+        var kmeans = new KMeans(k: k, maxIterations: 10, target: GpuTarget.Cpu);
+        kmeans.Fit(matrix);
+
+        int[] assignments = new int[nSamples];
+
+        // Warmup
+        for (int i = 0; i < 3; i++)
+        {
+            kmeans.Predict(matrix, assignments);
+        }
+
+        // Measure 10 runs
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        const int runs = 10;
+        for (int r = 0; r < runs; r++)
+        {
+            kmeans.Predict(matrix, assignments);
+        }
+        sw.Stop();
+
+        double elapsedMs = sw.Elapsed.TotalMilliseconds / runs;
+        double samplesPerSec = nSamples / (elapsedMs / 1000.0);
+
+        // Verify valid assignments
+        for (int i = 0; i < nSamples; i++)
+        {
+            Assert.InRange(assignments[i], 0, k - 1);
+        }
+
+        // Throughput must exceed 50M samples/sec (target > 80M samples/sec)
+        Assert.True(samplesPerSec > 50_000_000, $"Throughput was {samplesPerSec:N0} samples/sec, expected > 50,000,000 samples/sec (elapsed {elapsedMs:F3} ms)");
+    }
 }

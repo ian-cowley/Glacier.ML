@@ -11,6 +11,7 @@ public class KMeansBenchmarks
     private FeatureMatrix _matrix = null!;
     private KMeans _kmeans = null!;
     private float[] _queryRow = null!;
+    private int[] _assignments = null!;
 
     [Params(50_000)]
     public int N;
@@ -21,6 +22,7 @@ public class KMeansBenchmarks
         const int cols = 8;
         _matrix = new FeatureMatrix(N, cols);
         _queryRow = new float[cols];
+        _assignments = new int[N];
 
         var rng = new Random(42);
         for (int i = 0; i < N; i++)
@@ -48,5 +50,11 @@ public class KMeansBenchmarks
     public int PredictSingleSample()
     {
         return _kmeans.PredictRow(_queryRow);
+    }
+
+    [Benchmark]
+    public void PredictBatch_50k()
+    {
+        _kmeans.Predict(_matrix, _assignments);
     }
 }

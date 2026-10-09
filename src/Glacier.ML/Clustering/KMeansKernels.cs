@@ -238,4 +238,149 @@ public static unsafe class KMeansKernels
 
         return sum;
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void PredictBatchDecomposed(
+        ReadOnlySpan<float> data,
+        ReadOnlySpan<float> centroids,
+        ReadOnlySpan<float> centroidNormsSq,
+        int startRow,
+        int endRow,
+        int cols,
+        int k,
+        Span<int> assignments)
+    {
+        fixed (float* pData = data)
+        fixed (float* pCent = centroids)
+        fixed (float* pNorms = centroidNormsSq)
+        fixed (int* pAssign = assignments)
+        {
+            PredictBatchDecomposed(pData, pCent, pNorms, startRow, endRow, cols, k, pAssign);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void PredictBatchDecomposed(
+        float* pData,
+        float* pCentroids,
+        float* pCentroidNormsSq,
+        int startRow,
+        int endRow,
+        int cols,
+        int k,
+        int* pAssignments)
+    {
+        if (cols == 2)
+        {
+            for (int r = startRow; r < endRow; r++)
+            {
+                float* pRow = pData + ((long)r * 2);
+                float r0 = pRow[0];
+                float r1 = pRow[1];
+                float minDistance = float.MaxValue;
+                int bestCluster = 0;
+
+                for (int c = 0; c < k; c++)
+                {
+                    float* pC = pCentroids + ((long)c * 2);
+                    float dot = r0 * pC[0] + r1 * pC[1];
+                    float distScore = pCentroidNormsSq[c] - (2.0f * dot);
+                    if (distScore < minDistance)
+                    {
+                        minDistance = distScore;
+                        bestCluster = c;
+                    }
+                }
+                pAssignments[r] = bestCluster;
+            }
+            return;
+        }
+
+        if (cols == 3)
+        {
+            for (int r = startRow; r < endRow; r++)
+            {
+                float* pRow = pData + ((long)r * 3);
+                float r0 = pRow[0], r1 = pRow[1], r2 = pRow[2];
+                float minDistance = float.MaxValue;
+                int bestCluster = 0;
+
+                for (int c = 0; c < k; c++)
+                {
+                    float* pC = pCentroids + ((long)c * 3);
+                    float dot = r0 * pC[0] + r1 * pC[1] + r2 * pC[2];
+                    float distScore = pCentroidNormsSq[c] - (2.0f * dot);
+                    if (distScore < minDistance)
+                    {
+                        minDistance = distScore;
+                        bestCluster = c;
+                    }
+                }
+                pAssignments[r] = bestCluster;
+            }
+            return;
+        }
+
+        for (int r = startRow; r < endRow; r++)
+        {
+            float* pRow = pData + ((long)r * cols);
+            float minDistance = float.MaxValue;
+            int bestCluster = 0;
+
+            for (int c = 0; c < k; c++)
+            {
+                float* pC = pCentroids + ((long)c * cols);
+                float dot = 0f;
+                int d = 0;
+
+                if (Vector512.IsHardwareAccelerated && cols >= 16)
+                {
+                    var acc = Vector512<float>.Zero;
+                    for (; d <= cols - 16; d += 16)
+                    {
+                        acc = Vector512.MultiplyAddEstimate(Vector512.Load(pRow + d), Vector512.Load(pC + d), acc);
+                    }
+                    dot += Vector512.Sum(acc);
+                }
+
+                if (Vector256.IsHardwareAccelerated && d <= cols - 8)
+                {
+                    var acc = Vector256<float>.Zero;
+                    for (; d <= cols - 8; d += 8)
+                    {
+                        acc = Vector256.MultiplyAddEstimate(Vector256.Load(pRow + d), Vector256.Load(pC + d), acc);
+                    }
+                    dot += Vector256.Sum(acc);
+                }
+
+                if (Vector128.IsHardwareAccelerated && d <= cols - 4)
+                {
+                    var acc = Vector128<float>.Zero;
+                    for (; d <= cols - 4; d += 4)
+                    {
+                        acc = Vector128.MultiplyAddEstimate(Vector128.Load(pRow + d), Vector128.Load(pC + d), acc);
+                    }
+                    dot += Vector128.Sum(acc);
+                }
+
+                for (; d < cols; d++)
+                {
+                    dot += pRow[d] * pC[d];
+                }
+
+                // Matrix decomposition distance score:
+                // ||x - c||^2 = ||x||^2 + ||c||^2 - 2<x, c>
+                // Minimizing ||x - c||^2 is equivalent to minimizing ||c||^2 - 2<x, c>
+                float distScore = pCentroidNormsSq[c] - (2.0f * dot);
+
+                if (distScore < minDistance)
+                {
+                    minDistance = distScore;
+                    bestCluster = c;
+                }
+            }
+
+            pAssignments[r] = bestCluster;
+        }
+    }
 }

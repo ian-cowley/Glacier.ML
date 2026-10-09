@@ -17,6 +17,7 @@ public sealed class KMeans
     private readonly float _tolerance;
     private readonly GpuTarget _target;
     private float[] _centroids = Array.Empty<float>();
+    private float[] _centroidNormsSq = Array.Empty<float>();
     private int _dimensions;
 
     public int K => _k;
@@ -24,6 +25,7 @@ public sealed class KMeans
     public float Tolerance => _tolerance;
     public GpuTarget Target => _target;
     public float[] Centroids => _centroids;
+    public float[] CentroidNormsSq => _centroidNormsSq;
     public int Dimensions => _dimensions;
 
     public KMeans(int k = 8, int maxIterations = 100, float tolerance = 1e-4f, GpuTarget target = GpuTarget.Auto)
@@ -211,6 +213,8 @@ public sealed class KMeans
             if (maxShift < _tolerance)
                 break; // Converged
         }
+
+        UpdateCentroidNorms();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -225,6 +229,16 @@ public sealed class KMeans
         int rows = features.Rows;
         int cols = features.Columns;
         int k = Math.Min(_k, rows);
+
+        if (rows == 0 || k == 0 || _centroids.Length == 0)
+        {
+            return;
+        }
+
+        if (clusterAssignments.Length < rows)
+        {
+            throw new ArgumentException("Cluster assignments span must be at least as large as the number of rows.", nameof(clusterAssignments));
+        }
 
         if (features.IsColumnar)
         {
@@ -265,17 +279,48 @@ public sealed class KMeans
             return;
         }
 
+        if (_centroidNormsSq.Length != k)
+        {
+            UpdateCentroidNorms();
+        }
+
         unsafe
         {
-            fixed (float* pData = features.RawArray)
+            fixed (float* pData = features.Span)
             fixed (float* pCent = _centroids)
+            fixed (float* pNorms = _centroidNormsSq)
             fixed (int* pAssign = clusterAssignments)
             {
-                for (int r = 0; r < rows; r++)
+                if (rows < 512 || Environment.ProcessorCount <= 1)
                 {
-                    float* pRow = pData + (r * cols);
-                    pAssign[r] = KMeansKernels.FindNearestCentroid(pRow, pCent, k, cols);
+                    KMeansKernels.PredictBatchDecomposed(pData, pCent, pNorms, 0, rows, cols, k, pAssign);
+                    return;
                 }
+
+                int blockSize = rows switch
+                {
+                    < 2048 => 512,
+                    _ => 1024
+                };
+                int numBlocks = (rows + blockSize - 1) / blockSize;
+
+                nint dataAddr = (nint)pData;
+                nint centAddr = (nint)pCent;
+                nint normAddr = (nint)pNorms;
+                nint assignAddr = (nint)pAssign;
+
+                Parallel.For(0, numBlocks, b =>
+                {
+                    float* localData = (float*)dataAddr;
+                    float* localCent = (float*)centAddr;
+                    float* localNorms = (float*)normAddr;
+                    int* localAssign = (int*)assignAddr;
+
+                    int startRow = b * blockSize;
+                    int endRow = Math.Min(startRow + blockSize, rows);
+
+                    KMeansKernels.PredictBatchDecomposed(localData, localCent, localNorms, startRow, endRow, cols, k, localAssign);
+                });
             }
         }
     }
@@ -458,6 +503,31 @@ public sealed class KMeans
 
             if (maxShift < _tolerance)
                 break; // Converged
+        }
+
+        UpdateCentroidNorms();
+    }
+
+    private void UpdateCentroidNorms()
+    {
+        if (_dimensions <= 0 || _centroids.Length == 0) return;
+
+        int k = Math.Min(_k, _centroids.Length / _dimensions);
+        if (_centroidNormsSq.Length != k)
+        {
+            _centroidNormsSq = new float[k];
+        }
+
+        for (int c = 0; c < k; c++)
+        {
+            float sum = 0f;
+            int offset = c * _dimensions;
+            for (int d = 0; d < _dimensions; d++)
+            {
+                float v = _centroids[offset + d];
+                sum += v * v;
+            }
+            _centroidNormsSq[c] = sum;
         }
     }
 
