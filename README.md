@@ -34,6 +34,7 @@
 | Operation | Dataset / Configuration | Scikit-Learn (Python) | Glacier.ML (CPU) | Glacier.ML (Bare-Metal GPU) | Speedup vs Python |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **KMeans Batch Predict** | 100,000 samples × 8 features | ~42 ms | 5.6 ms | **< 1.0 ms (0.5 ms)** | **> 80x** |
+| **KMeans Batch Predict (Fleet)** | 50,000 samples × 10 features | 0.80 ms (62.3M/s) | **0.46 ms (109.9M/s)** | — | **1.76x faster** |
 | **KMeans Fit** | 100,000 rows × 8 features ($k=8$, 20 iters) | ~680 ms | 180 ms | **127 ms** | **5.3x** |
 | **FastLinearRegression Inference** | 100,000 samples | ~35 ms | 6 ms | **1 ms** | **35x** |
 | **FastPCA Covariance ($X^T X$)** | 100,000 samples × 64 dims | ~120 ms | 35 ms | **14 ms** | **8.5x** |

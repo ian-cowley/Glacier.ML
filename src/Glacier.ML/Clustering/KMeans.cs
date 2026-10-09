@@ -228,9 +228,18 @@ public sealed class KMeans
     {
         int rows = features.Rows;
         int cols = features.Columns;
-        int k = Math.Min(_k, rows);
+        if (rows == 0 || _centroids.Length == 0)
+        {
+            return;
+        }
 
-        if (rows == 0 || k == 0 || _centroids.Length == 0)
+        if (_dimensions > 0 && cols != _dimensions)
+        {
+            throw new ArgumentException($"Expected {_dimensions} features but got {cols}.", nameof(features));
+        }
+
+        int k = _dimensions > 0 ? _centroids.Length / _dimensions : _k;
+        if (k == 0)
         {
             return;
         }
