@@ -192,6 +192,9 @@ public static unsafe class KMeansKernels
     public static float EuclideanDistanceSquared(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
     {
         int length = a.Length;
+        if (b.Length < length)
+            throw new ArgumentException("Span b must be at least as long as span a.", nameof(b));
+
         float sum = 0f;
 
         fixed (float* pA = a)

@@ -31,8 +31,30 @@ public sealed class OneHotEncoder
 
     public void Transform(ReadOnlySpan<int> categories, FeatureMatrix outputMatrix, int startCol)
     {
-        if (outputMatrix.Columns < startCol + _numCategories)
-            throw new ArgumentException("Output matrix does not have enough columns.");
+        if (startCol < 0 || outputMatrix.Columns < startCol + _numCategories)
+            throw new ArgumentException("Output matrix does not have enough columns.", nameof(outputMatrix));
+        if (outputMatrix.Rows < categories.Length)
+            throw new ArgumentException("Output matrix does not have enough rows for categories.", nameof(outputMatrix));
+
+        if (outputMatrix.IsColumnar)
+        {
+            if (!outputMatrix.IsWritableColumnar)
+                throw new InvalidOperationException("Cannot transform into a read-only columnar FeatureMatrix. Construct FeatureMatrix with writable Memory<float>[] columns or a row-major buffer.");
+
+            for (int c = 0; c < _numCategories; c++)
+            {
+                outputMatrix.GetWritableColumn(startCol + c).Slice(0, categories.Length).Clear();
+            }
+
+            for (int r = 0; r < categories.Length; r++)
+            {
+                if (_categoryToIndex.TryGetValue(categories[r], out int colOffset))
+                {
+                    outputMatrix.GetWritableColumn(startCol + colOffset)[r] = 1.0f;
+                }
+            }
+            return;
+        }
 
         for (int r = 0; r < categories.Length; r++)
         {

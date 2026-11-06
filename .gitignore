@@ -40,3 +40,9 @@ brain/
 scratch/
 PROJECT_SOURCE.md
 Glacier.ML.md
+
+# Secrets & local configuration
+appsettings*.json
+!appsettings.template.json
+*.env*
+

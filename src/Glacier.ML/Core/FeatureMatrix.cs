@@ -15,6 +15,7 @@ public sealed unsafe class FeatureMatrix : IDisposable
     private readonly bool _ownsNative;
     private readonly IDisposable? _lifetimeOwner;
     private readonly ReadOnlyMemory<float>[]? _columnarMemories;
+    private readonly Memory<float>[]? _writableColumnarMemories;
     private readonly int _rows;
     private readonly int _cols;
     private readonly string[]? _featureNames;
@@ -28,6 +29,7 @@ public sealed unsafe class FeatureMatrix : IDisposable
     public int Columns => _cols;
     public string[]? FeatureNames => _featureNames;
     public bool IsColumnar => _columnarMemories != null;
+    public bool IsWritableColumnar => _writableColumnarMemories != null;
     public bool IsNative => _nativeData != null;
 
     public unsafe float* NativePointer => _nativeData;
@@ -108,14 +110,17 @@ public sealed unsafe class FeatureMatrix : IDisposable
         _cols = columns.Length;
         _rows = columns[0].Length;
         var roColumns = new ReadOnlyMemory<float>[_cols];
+        var rwColumns = new Memory<float>[_cols];
         for (int c = 0; c < _cols; c++)
         {
             if (columns[c].Length != _rows)
                 throw new ArgumentException($"Column at index {c} has length {columns[c].Length}, expected {_rows}.");
             roColumns[c] = columns[c];
+            rwColumns[c] = columns[c];
         }
 
         _columnarMemories = roColumns;
+        _writableColumnarMemories = rwColumns;
         _featureNames = featureNames;
     }
 
@@ -157,6 +162,24 @@ public sealed unsafe class FeatureMatrix : IDisposable
         }
 
         throw new InvalidOperationException("FeatureMatrix is stored in row-major layout; use CopyColumn to extract non-contiguous column data.");
+    }
+
+    /// <summary>
+    /// Returns a writable contiguous column span in O(1) for writable columnar FeatureMatrix instances.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public Span<float> GetWritableColumn(int colIndex)
+    {
+        if ((uint)colIndex >= (uint)_cols)
+            throw new ArgumentOutOfRangeException(nameof(colIndex));
+
+        if (_writableColumnarMemories != null)
+        {
+            _data = null;
+            return _writableColumnarMemories[colIndex].Span;
+        }
+
+        throw new InvalidOperationException("FeatureMatrix is not backed by writable columnar memory.");
     }
 
     /// <summary>
@@ -212,15 +235,7 @@ public sealed unsafe class FeatureMatrix : IDisposable
 
         if (_columnarMemories != null)
         {
-            if (t_rowBuffer == null || t_rowBuffer.Length < _cols)
-            {
-                t_rowBuffer = new float[_cols];
-            }
-            for (int c = 0; c < _cols; c++)
-            {
-                t_rowBuffer[c] = _columnarMemories[c].Span[rowIndex];
-            }
-            return new Span<float>(t_rowBuffer, 0, _cols);
+            throw new InvalidOperationException("Cannot acquire a mutable contiguous row span from a columnar FeatureMatrix; use GetWritableColumn or SetValue on writable columnar matrices.");
         }
         else if (_nativeData != null)
         {
@@ -252,7 +267,12 @@ public sealed unsafe class FeatureMatrix : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public unsafe void SetValue(int row, int col, float value)
     {
-        if (_columnarMemories != null)
+        if (_writableColumnarMemories != null)
+        {
+            _data = null;
+            _writableColumnarMemories[col].Span[row] = value;
+        }
+        else if (_columnarMemories != null)
         {
             throw new InvalidOperationException("FeatureMatrix is backed by read-only columnar memory.");
         }

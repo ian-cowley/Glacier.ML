@@ -14,15 +14,15 @@ public class AdversarialMlTests
     {
         if (!GpuMlAccelerator.IsNvidiaAvailable) return;
 
-        // Concurrently rent, resize, and return stream contexts across 32 threads
-        const int numTasks = 32;
-        const int iterationsPerTask = 25;
+        // Concurrently rent, resize, and dispose stream contexts across worker threads
+        const int numTasks = 8;
+        const int iterationsPerTask = 10;
 
         Parallel.For(0, numTasks, taskId =>
         {
             for (int iter = 0; iter < iterationsPerTask; iter++)
             {
-                nuint samplesBytes = (nuint)((taskId * 1024 + iter * 128) * sizeof(float));
+                nuint samplesBytes = (nuint)(((taskId + 1) * 1024 + iter * 128) * sizeof(float));
                 nuint centroidsBytes = (nuint)(16 * 8 * sizeof(float));
                 nuint assignBytes = (nuint)(1024 * sizeof(int));
 

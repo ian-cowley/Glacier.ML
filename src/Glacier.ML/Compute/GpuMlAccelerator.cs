@@ -6,6 +6,7 @@ using System.Runtime.Intrinsics;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Glacier.Gpu.Compilation;
 using Glacier.Gpu.Drivers;
 using Glacier.Gpu.Engines;
 using Glacier.Gpu.RingBuffer;
@@ -54,12 +55,16 @@ public static unsafe class GpuMlAccelerator
     private static IntPtr s_dVecC;
     private static nuint s_capVecBytes;
 
-    private static bool s_amdInitialized;
-    private static bool s_amdAvailable;
+    static GpuMlAccelerator()
+    {
+        AppDomain.CurrentDomain.ProcessExit += static (_, _) => ShutdownRingBuffer();
+    }
+
+    internal static IntPtr ContextHandle => s_cuContext;
 
     public static bool IsNvidiaAvailable => EnsureNvidiaInitialized();
-    public static bool IsAmdAvailable => EnsureAmdInitialized();
-    public static bool IsGpuAvailable => IsNvidiaAvailable || IsAmdAvailable;
+    public static bool IsAmdAvailable => false;
+    public static bool IsGpuAvailable => IsNvidiaAvailable;
 
     #region Driver Initialization
 
@@ -104,11 +109,7 @@ public static unsafe class GpuMlAccelerator
                     return false;
                 }
 
-                string ptx = GpuMlKernels.PtxSource;
-                if (!ptx.Contains($".target {targetArch}"))
-                {
-                    ptx = System.Text.RegularExpressions.Regex.Replace(ptx, @"\.target\s+sm_\d+", $".target {targetArch}");
-                }
+                string ptx = KernelCompiler.NormalizePtxDirectives(GpuMlKernels.PtxSource, targetArch);
 
                 byte[] ptxBytes = Encoding.UTF8.GetBytes(ptx + "\0");
                 if (CuDriver.ModuleLoadData(out s_cuModule, ptxBytes) != 0)
@@ -141,45 +142,6 @@ public static unsafe class GpuMlAccelerator
         }
     }
 
-    private static bool EnsureAmdInitialized()
-    {
-        if (s_amdInitialized) return s_amdAvailable;
-        lock (s_initLock)
-        {
-            if (s_amdInitialized) return s_amdAvailable;
-            try
-            {
-                if (!HipDriver.IsAvailable())
-                {
-                    s_amdAvailable = false;
-                    s_amdInitialized = true;
-                    return false;
-                }
-
-                HipDriver.Init(0);
-                if (HipDriver.GetDeviceCount(out int count) != 0 || count == 0)
-                {
-                    s_amdAvailable = false;
-                    s_amdInitialized = true;
-                    return false;
-                }
-
-                HipDriver.SetDevice(0);
-                s_amdAvailable = true;
-            }
-            catch
-            {
-                s_amdAvailable = false;
-            }
-            finally
-            {
-                s_amdInitialized = true;
-            }
-
-            return s_amdAvailable;
-        }
-    }
-
     #endregion
 
     #region K-Means Assignment Offload
@@ -208,7 +170,7 @@ public static unsafe class GpuMlAccelerator
                 return ExecuteNvidiaKMeansAssign(samples, centroids, assignments, n, k, d);
 
             case GpuTarget.Amd:
-                return ExecuteAmdKMeansAssign(samples, centroids, assignments, n, k, d);
+                return false;
 
             case GpuTarget.Auto:
             default:
@@ -216,9 +178,6 @@ public static unsafe class GpuMlAccelerator
                 if (n < 512) return false;
 
                 if (EnsureNvidiaInitialized() && ExecuteNvidiaKMeansAssign(samples, centroids, assignments, n, k, d))
-                    return true;
-
-                if (EnsureAmdInitialized() && ExecuteAmdKMeansAssign(samples, centroids, assignments, n, k, d))
                     return true;
 
                 return false;
@@ -234,6 +193,8 @@ public static unsafe class GpuMlAccelerator
         int d)
     {
         if (!EnsureNvidiaInitialized()) return false;
+        if (samples.Length < n * d || centroids.Length < k * d || assignments.Length < n)
+            return false;
 
         nuint bytesSamples = (nuint)(n * d * sizeof(float));
         nuint bytesCentroids = (nuint)(k * d * sizeof(float));
@@ -244,6 +205,8 @@ public static unsafe class GpuMlAccelerator
         {
             CuDriver.CtxSetCurrent(s_cuContext);
             ctx.EnsureCapacity(bytesSamples, bytesCentroids, bytesAssignments);
+            if (ctx.DeviceSamples == IntPtr.Zero || ctx.DeviceCentroids == IntPtr.Zero || ctx.DeviceAssignments == IntPtr.Zero)
+                return false;
 
             fixed (float* pSamples = samples)
             fixed (float* pCentroids = centroids)
@@ -259,34 +222,30 @@ public static unsafe class GpuMlAccelerator
                 int argK = k;
                 int argD = d;
 
-                void* pArgSamples = &argSamples;
-                void* pArgCentroids = &argCentroids;
-                void* pArgAssignments = &argAssignments;
-                void* pArgN = &argN;
-                void* pArgK = &argK;
-                void* pArgD = &argD;
+                void** pKernelParams = stackalloc void*[6];
+                pKernelParams[0] = &argSamples;
+                pKernelParams[1] = &argCentroids;
+                pKernelParams[2] = &argAssignments;
+                pKernelParams[3] = &argN;
+                pKernelParams[4] = &argK;
+                pKernelParams[5] = &argD;
 
-                void*[] kernelParams = [pArgSamples, pArgCentroids, pArgAssignments, pArgN, pArgK, pArgD];
+                uint blockSize = 256;
+                uint gridSize = (uint)((n + 255) / 256);
 
-                fixed (void* pKernelParams = kernelParams)
-                {
-                    uint blockSize = 256;
-                    uint gridSize = (uint)((n + 255) / 256);
+                int launchRes = CuDriver.LaunchKernel(
+                    s_fnKMeansAssign,
+                    gridSize, 1, 1,
+                    blockSize, 1, 1,
+                    0, ctx.Stream,
+                    (IntPtr)pKernelParams,
+                    IntPtr.Zero);
 
-                    int launchRes = CuDriver.LaunchKernel(
-                        s_fnKMeansAssign,
-                        gridSize, 1, 1,
-                        blockSize, 1, 1,
-                        0, ctx.Stream,
-                        (IntPtr)pKernelParams,
-                        IntPtr.Zero);
+                if (launchRes != 0) return false;
 
-                    if (launchRes != 0) return false;
-
-                    CuDriver.MemcpyDtoHAsync((IntPtr)pAssignments, ctx.DeviceAssignments, bytesAssignments, ctx.Stream);
-                    CuDriver.StreamSynchronize(ctx.Stream);
-                    return true;
-                }
+                CuDriver.MemcpyDtoHAsync((IntPtr)pAssignments, ctx.DeviceAssignments, bytesAssignments, ctx.Stream);
+                CuDriver.StreamSynchronize(ctx.Stream);
+                return true;
             }
         }
         catch
@@ -297,21 +256,6 @@ public static unsafe class GpuMlAccelerator
         {
             ReturnContext(ctx);
         }
-    }
-
-    private static bool ExecuteAmdKMeansAssign(
-        ReadOnlySpan<float> samples,
-        ReadOnlySpan<float> centroids,
-        Span<int> assignments,
-        int n,
-        int k,
-        int d)
-    {
-        if (!EnsureAmdInitialized()) return false;
-
-        // AMD APU zero-copy unified memory synchronization
-        HipDriver.DeviceSynchronize();
-        return false; // Falls through to AVX-512 CPU on APU if HIP kernel is not precompiled
     }
 
     #endregion
@@ -498,25 +442,63 @@ public static unsafe class GpuMlAccelerator
         }
     }
 
+    /// <summary>
+    /// Cleanly shuts down the persistent GPU ring buffer worker if running.
+    /// </summary>
+    public static void ShutdownRingBuffer()
+    {
+        lock (s_ringBufferLock)
+        {
+            try
+            {
+                if (s_ringBuffer != null && !s_ringBuffer.IsDisposed)
+                {
+                    s_ringBuffer.Dispose();
+                    s_ringBuffer = null;
+                }
+            }
+            catch
+            {
+                // Ignore driver teardown errors during process exit
+            }
+        }
+    }
+
     private static bool EnsureVectorBuffers(nuint requiredBytes)
     {
-        if (requiredBytes <= s_capVecBytes) return true;
+        nuint allocBytes = requiredBytes < 1024 * 1024 ? 1024 * 1024 : requiredBytes;
+        if (allocBytes <= s_capVecBytes && s_hVecA != IntPtr.Zero && s_hVecB != IntPtr.Zero && s_hVecC != IntPtr.Zero)
+            return true;
+
+        // cuMemFreeHost is a synchronous context barrier; stop the persistent worker before freeing host-mapped memory.
+        bool wasRingRunning = s_ringBuffer != null && !s_ringBuffer.IsDisposed;
+        if (wasRingRunning)
+        {
+            s_ringBuffer!.Dispose();
+            s_ringBuffer = null;
+        }
 
         if (s_hVecA != IntPtr.Zero) { CuDriver.MemFreeHost(s_hVecA); s_hVecA = s_dVecA = IntPtr.Zero; }
         if (s_hVecB != IntPtr.Zero) { CuDriver.MemFreeHost(s_hVecB); s_hVecB = s_dVecB = IntPtr.Zero; }
         if (s_hVecC != IntPtr.Zero) { CuDriver.MemFreeHost(s_hVecC); s_hVecC = s_dVecC = IntPtr.Zero; }
+        s_capVecBytes = 0;
 
         uint flags = CuDriver.CU_MEMHOSTALLOC_DEVICEMAP | CuDriver.CU_MEMHOSTALLOC_PORTABLE;
-        if (CuDriver.MemHostAlloc(out s_hVecA, requiredBytes, flags) != 0) return false;
+        if (CuDriver.MemHostAlloc(out s_hVecA, allocBytes, flags) != 0) return false;
         if (CuDriver.MemHostGetDevicePointer(out s_dVecA, s_hVecA, 0) != 0) return false;
 
-        if (CuDriver.MemHostAlloc(out s_hVecB, requiredBytes, flags) != 0) return false;
+        if (CuDriver.MemHostAlloc(out s_hVecB, allocBytes, flags) != 0) return false;
         if (CuDriver.MemHostGetDevicePointer(out s_dVecB, s_hVecB, 0) != 0) return false;
 
-        if (CuDriver.MemHostAlloc(out s_hVecC, requiredBytes, flags) != 0) return false;
+        if (CuDriver.MemHostAlloc(out s_hVecC, allocBytes, flags) != 0) return false;
         if (CuDriver.MemHostGetDevicePointer(out s_dVecC, s_hVecC, 0) != 0) return false;
 
-        s_capVecBytes = requiredBytes;
+        s_capVecBytes = allocBytes;
+        if (wasRingRunning && s_nvidiaEngine != null)
+        {
+            s_ringBuffer = s_nvidiaEngine.GetOrCreateRingBuffer(256);
+        }
+
         return true;
     }
 
@@ -589,8 +571,7 @@ public static unsafe class GpuMlAccelerator
         Span<float> destination,
         float scalar)
     {
-        var ring = GetRingBuffer();
-        if (ring == null || s_nvidiaEngine == null) return false;
+        if (!EnsureNvidiaInitialized()) return false;
 
         int count = a.Length;
         nuint bytes = (nuint)(count * sizeof(float));
@@ -599,10 +580,20 @@ public static unsafe class GpuMlAccelerator
         {
             try
             {
+                lock (s_initLock)
+                {
+                    s_nvidiaEngine ??= new NvidiaSassEngine();
+                    if (!s_nvidiaEngine.IsInitialized)
+                        s_nvidiaEngine.Initialize();
+                }
+
                 CuDriver.CtxSetCurrent(s_nvidiaEngine.ContextHandle);
 
                 if (!EnsureVectorBuffers(bytes))
                     return false;
+
+                var ring = GetRingBuffer();
+                if (ring == null) return false;
 
                 var spanA = new Span<float>((void*)s_hVecA, count);
                 var spanB = new Span<float>((void*)s_hVecB, count);
@@ -726,34 +717,66 @@ public sealed class GpuMlStreamContext : IDisposable
 
     public GpuMlStreamContext()
     {
-        CuDriver.StreamCreate(out IntPtr stream, 0);
-        Stream = stream;
+        if (GpuMlAccelerator.IsNvidiaAvailable && GpuMlAccelerator.ContextHandle != IntPtr.Zero)
+        {
+            CuDriver.CtxSetCurrent(GpuMlAccelerator.ContextHandle);
+            if (CuDriver.StreamCreate(out IntPtr stream, CuDriver.CU_STREAM_NON_BLOCKING) == 0)
+            {
+                Stream = stream;
+            }
+        }
     }
 
     public void EnsureCapacity(nuint bytesSamples, nuint bytesCentroids, nuint bytesAssignments)
     {
+        if (!GpuMlAccelerator.IsNvidiaAvailable || GpuMlAccelerator.ContextHandle == IntPtr.Zero)
+            return;
+
+        CuDriver.CtxSetCurrent(GpuMlAccelerator.ContextHandle);
+
         if (bytesSamples > CapSamples)
         {
             if (DeviceSamples != IntPtr.Zero) CuDriver.MemFree(DeviceSamples);
-            CuDriver.MemAlloc(out IntPtr dS, bytesSamples);
-            DeviceSamples = dS;
-            CapSamples = bytesSamples;
+            if (CuDriver.MemAlloc(out IntPtr dS, bytesSamples) == 0)
+            {
+                DeviceSamples = dS;
+                CapSamples = bytesSamples;
+            }
+            else
+            {
+                DeviceSamples = IntPtr.Zero;
+                CapSamples = 0;
+            }
         }
 
         if (bytesCentroids > CapCentroids)
         {
             if (DeviceCentroids != IntPtr.Zero) CuDriver.MemFree(DeviceCentroids);
-            CuDriver.MemAlloc(out IntPtr dC, bytesCentroids);
-            DeviceCentroids = dC;
-            CapCentroids = bytesCentroids;
+            if (CuDriver.MemAlloc(out IntPtr dC, bytesCentroids) == 0)
+            {
+                DeviceCentroids = dC;
+                CapCentroids = bytesCentroids;
+            }
+            else
+            {
+                DeviceCentroids = IntPtr.Zero;
+                CapCentroids = 0;
+            }
         }
 
         if (bytesAssignments > CapAssignments)
         {
             if (DeviceAssignments != IntPtr.Zero) CuDriver.MemFree(DeviceAssignments);
-            CuDriver.MemAlloc(out IntPtr dA, bytesAssignments);
-            DeviceAssignments = dA;
-            CapAssignments = bytesAssignments;
+            if (CuDriver.MemAlloc(out IntPtr dA, bytesAssignments) == 0)
+            {
+                DeviceAssignments = dA;
+                CapAssignments = bytesAssignments;
+            }
+            else
+            {
+                DeviceAssignments = IntPtr.Zero;
+                CapAssignments = 0;
+            }
         }
     }
 
@@ -762,10 +785,14 @@ public sealed class GpuMlStreamContext : IDisposable
         if (!_disposed)
         {
             _disposed = true;
-            if (DeviceSamples != IntPtr.Zero) CuDriver.MemFree(DeviceSamples);
-            if (DeviceCentroids != IntPtr.Zero) CuDriver.MemFree(DeviceCentroids);
-            if (DeviceAssignments != IntPtr.Zero) CuDriver.MemFree(DeviceAssignments);
-            if (Stream != IntPtr.Zero) CuDriver.StreamDestroy(Stream);
+            if (GpuMlAccelerator.IsNvidiaAvailable && GpuMlAccelerator.ContextHandle != IntPtr.Zero)
+            {
+                CuDriver.CtxSetCurrent(GpuMlAccelerator.ContextHandle);
+                if (DeviceSamples != IntPtr.Zero) CuDriver.MemFree(DeviceSamples);
+                if (DeviceCentroids != IntPtr.Zero) CuDriver.MemFree(DeviceCentroids);
+                if (DeviceAssignments != IntPtr.Zero) CuDriver.MemFree(DeviceAssignments);
+                if (Stream != IntPtr.Zero) CuDriver.StreamDestroy(Stream);
+            }
         }
     }
 }

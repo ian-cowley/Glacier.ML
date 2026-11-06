@@ -42,6 +42,8 @@ public sealed class FastLogisticRegression : IPredictor
     {
         int rows = features.Rows;
         int cols = features.Columns;
+        if (targets.Length < rows)
+            throw new ArgumentException("Targets length must match or exceed feature rows.", nameof(targets));
 
         _weights = new float[cols];
         _bias = 0f;
@@ -135,6 +137,8 @@ public sealed class FastLogisticRegression : IPredictor
     {
         int rows = features.Rows;
         int cols = features.Columns;
+        if (predictions.Length < rows)
+            throw new ArgumentException("Predictions span is smaller than feature rows.", nameof(predictions));
 
         if (rows >= 1024 && GpuMlAccelerator.IsGpuAvailable && _target != GpuTarget.Cpu)
         {

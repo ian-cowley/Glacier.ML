@@ -10,7 +10,7 @@
 [![Website](https://img.shields.io/badge/Website-glaciersoftware.dev-66fcf1.svg)](https://glaciersoftware.dev/)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support-orange.svg?logo=buy-me-a-coffee)](https://buymeacoffee.com/glaciersoftware)
 
-> **Hardware-Accelerated Classical Machine Learning Engine for C# .NET 10 (Systematically Beating Python Scikit-Learn)**
+> **Hardware-Accelerated Classical Machine Learning Engine for C# .NET 10**
 
 `Glacier.ML` is a pure C# .NET 10 classical machine learning engine engineered for extreme throughput, zero-heap allocations on hot estimation paths, and zero-copy ingestion directly from Apache Arrow columnar data structures (`Glacier.Polaris`). It serves as Pillar 2 of the unified **Glacier .NET 10 High-Performance Ecosystem**.
 
@@ -18,14 +18,14 @@
 
 ## 🚀 Key Highlights
 
-- **Hardware-Accelerated Kernels**: Saturated vectorization using `Vector512<float>`, `Vector256<float>`, and `AdvSimd` for dot products, squared Euclidean distances, and vector reductions.
-- **Bare-Metal GPU Acceleration**: Direct P/Invoke driver execution (`nvcuda.dll` and `amdhip64.dll`) offloading K-Means cluster assignment, PCA covariance calculations, and regression normal equations to NVIDIA RTX 4060 dGPU and AMD APUs without CUDA/ROCm SDK dependencies.
-- **Dynamic Hardware Target Scaling**: Select between `GpuTarget.Auto`, `GpuTarget.Nvidia`, `GpuTarget.Amd`, and `GpuTarget.Cpu` dynamically based on batch sizes and hardware availability.
+- **Hardware-Accelerated Kernels**: Saturated vectorization using `Vector512<float>`, `Vector256<float>`, `Vector128<float>`, and `AdvSimd` for dot products, squared Euclidean distances, and vector reductions.
+- **Bare-Metal GPU Acceleration**: Direct P/Invoke CUDA Driver execution (`nvcuda.dll`) offloading K-Means cluster assignment and persistent ring-buffer vector kernels (`VectorAdd` / `VectorFma`) to NVIDIA GPUs (`sm_75+`) without CUDA SDK runtime dependencies, with automatic SIMD CPU fallback.
+- **Dynamic Hardware Target Scaling**: Select between `GpuTarget.Auto`, `GpuTarget.Nvidia`, and `GpuTarget.Cpu` dynamically based on batch sizes and hardware availability.
 - **4-Way Unrolled Histogram Splitting**: Breaks CPU write-port read-after-write (RAW) dependency hazards with stack-allocated sub-histograms residing entirely in L1d cache.
 - **Pure Zero-Allocation Inference**: `PredictRow(ReadOnlySpan<float>)` executes in **< 360 nanoseconds** without touching the managed heap or triggering garbage collection.
 - **Multi-Core Parallelism**: Trains Random Forest ensembles and assigns KMeans clusters across all logical CPU cores and GPU streaming multiprocessors without GIL bottlenecks.
-- **Zero-Copy Columnar Interop**: Directly train on `Glacier.Polaris` DataFrames using contiguous memory pointers without data duplication.
-- **Native AOT Ready**: 100% compatible with Ahead-of-Time compilation for microsecond cold starts and single-file native binaries.
+- **Zero-Copy Columnar Interop**: Directly train and preprocess `Glacier.Polaris` DataFrames and writable columnar `FeatureMatrix` buffers without data duplication.
+- **Native AOT Ready**: 100% compatible with Ahead-of-Time compilation (`IsAotCompatible=true`) for microsecond cold starts and single-file native binaries.
 
 ---
 
@@ -50,11 +50,11 @@
 
 ```mermaid
 graph TD
-    A[Polaris DataFrame / Arrow RecordBatch] -->|Zero-Copy Pointers| B[FeatureMatrix Contiguous Pinned Memory]
+    A[Polaris DataFrame / Arrow RecordBatch] -->|Zero-Copy Pointers| B[FeatureMatrix Contiguous / Columnar Memory]
     B --> C[Preprocessing: StandardScaler / MinMaxScaler / OneHot]
-    C --> D[SIMD Compute Kernels]
+    C --> D[SIMD & Bare-Metal CUDA Kernels]
     D --> E1[FastRandomForest / FastDecisionTree: 4-Way L1d Histograms]
-    D --> E2[KMeans: Vector512 / Vector256 Distance Sinks]
+    D --> E2[KMeans: Vector512 / CUDA Distance Sinks]
     D --> E3[FastLogisticRegression: FMA Vectorized Dot Products]
     E1 --> F[Sub-Microsecond Zero-Allocation Predict]
     E2 --> F
@@ -71,7 +71,7 @@ using Glacier.ML.Core;
 using Glacier.ML.Trees;
 
 // Initialize contiguous pinned feature matrix
-var features = new FeatureMatrix(100_000, 8);
+using var features = new FeatureMatrix(100_000, 8);
 float[] targets = LoadLabels();
 
 // Train 50 trees concurrently across all CPU cores
@@ -89,13 +89,13 @@ float probability = forest.PredictProbability(sample);
 using Glacier.ML.Clustering;
 using Glacier.ML.Core;
 
-// Automatically selects NVIDIA RTX 4060 dGPU, AMD APU, or AVX-512 CPU
+// Automatically selects NVIDIA GPU or AVX-512 CPU
 var kmeans = new KMeans(k: 16, maxIterations: 20, target: GpuTarget.Auto);
 kmeans.Fit(features);
 
 int[] assignments = new int[features.Rows];
 // Predict on 100,000 samples in < 1 ms via bare-metal GPU kernel
-kmeans.Predict(features, assignments, GpuTarget.Nvidia);
+kmeans.Predict(features, assignments);
 ```
 
 ### 3. Polaris DataFrame Direct Integration
@@ -116,17 +116,15 @@ var kmeans = df.FitKMeans(
 );
 ```
 
-### 4. Persistent Ring Buffer Megakernel (Sub-100 ns GPU Dispatch)
+### 4. Persistent Ring Buffer Megakernel Dispatch
 ```csharp
 using Glacier.ML.Compute;
+using Glacier.ML.Core;
 
-// Initialize persistent polling megakernel over device-mapped pinned host memory
-var ring = GpuMlAccelerator.GetRingBuffer();
-
-// Dispatches VectorAdd or VectorFma directly to spinning GPU SMs in ~88 nanoseconds
-// Completely bypasses OS driver transitions (cuLaunchKernel 8-12 μs) and stream synchronization
-ring.VectorAdd(aSpan, bSpan, outSpan);
-ring.VectorFma(aSpan, bSpan, cSpan, outSpan);
+// Dispatches VectorAdd or VectorFma directly to the persistent GPU ring buffer worker when available,
+// bypassing per-call cuLaunchKernel launch latency with automatic AVX-512 / AVX2 fallback
+GpuMlAccelerator.VectorAdd(aSpan, bSpan, outSpan, GpuTarget.Auto);
+GpuMlAccelerator.VectorFma(aSpan, bSpan, outSpan, scalar: -0.05f, GpuTarget.Auto);
 ```
 
 ---
@@ -149,16 +147,17 @@ dotnet run --project samples/Glacier.ML.Demo/Glacier.ML.Demo.csproj -c Release
 
 `Glacier.ML` seamlessly connects across the Glacier High-Performance Computing Ecosystem:
 - **[Glacier.Polaris](https://github.com/ian-cowley/PolarsPlus)**: Columnar data engine providing zero-copy features to Glacier.ML.
+- **[Glacier.Gpu](https://github.com/ian-cowley/Glacier.Gpu)**: Bare-metal CUDA/HIP driver bindings and persistent ring-buffer megakernels.
 - **[Glacier.Tensor](https://github.com/ian-cowley/Glacier.Tensor)**: Strided N-D tensors and autograd for deep learning.
 - **[Glacier.Serve](https://github.com/ian-cowley/Glacier.Serve)**: Sub-millisecond Native AOT model serving microservices.
 
 ---
 
-## 🆕 What's New in v1.0.3
+## 🆕 What's New in v1.1.0
 
-- **`GpuMlStreamContext` pool** — per-thread GPU memory reuse, eliminating repeated allocation/deallocation cycles in tight training loops.
-- **Zero-alloc in-place Hoare partition tree split** — removes all recursive stack allocation in the decision tree splitting path, enabling deeper trees without stack overflow risk.
-- **35 tests** passing (100 %).
+- **True Zero-Copy Writable Columnar Transforms** — `StandardScaler`, `MinMaxScaler`, and `OneHotEncoder` now transform writable columnar `FeatureMatrix(Memory<float>[])` instances directly in-place and guard read-only columnar views against silent mutation loss.
+- **Hardened CUDA Stream & Persistent Ring Buffer Lifecycle** — Per-thread CUDA context binding on `GpuMlStreamContext`, lockstep PTX `.version` / `.target` normalization via `Glacier.Gpu 1.1.0`, and barrier-safe persistent ring buffer host-mapped memory management.
+- **Strict Native AOT & Bounds Hygiene** — Full `IsAotCompatible` + `TreatWarningsAsErrors` verification, hardened kernel span bounds checks, and `Glacier.Polaris 1.1.0` + `Glacier.Gpu 1.1.0` integration.
 
 ---
 

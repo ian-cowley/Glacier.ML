@@ -24,24 +24,47 @@ public sealed class StandardScaler : ITransformer
         _means = new float[cols];
         _stdDevs = new float[cols];
 
-        Span<float> colBuffer = stackalloc float[Math.Min(rows, 4096)];
-
         for (int c = 0; c < cols; c++)
         {
             double sum = 0;
-            for (int r = 0; r < rows; r++)
+            if (matrix.IsColumnar)
             {
-                sum += matrix.GetValue(r, c);
+                ReadOnlySpan<float> col = matrix.GetColumn(c);
+                for (int r = 0; r < rows; r++)
+                {
+                    sum += col[r];
+                }
             }
+            else
+            {
+                for (int r = 0; r < rows; r++)
+                {
+                    sum += matrix.GetValue(r, c);
+                }
+            }
+
             float mean = (float)(sum / rows);
             _means[c] = mean;
 
             double sumSqDiff = 0;
-            for (int r = 0; r < rows; r++)
+            if (matrix.IsColumnar)
             {
-                float diff = matrix.GetValue(r, c) - mean;
-                sumSqDiff += diff * diff;
+                ReadOnlySpan<float> col = matrix.GetColumn(c);
+                for (int r = 0; r < rows; r++)
+                {
+                    float diff = col[r] - mean;
+                    sumSqDiff += diff * diff;
+                }
             }
+            else
+            {
+                for (int r = 0; r < rows; r++)
+                {
+                    float diff = matrix.GetValue(r, c) - mean;
+                    sumSqDiff += diff * diff;
+                }
+            }
+
             float std = (float)Math.Sqrt(sumSqDiff / rows);
             _stdDevs[c] = std > 1e-8f ? std : 1f; // Avoid division by zero
         }
@@ -54,7 +77,25 @@ public sealed class StandardScaler : ITransformer
             throw new InvalidOperationException("StandardScaler must be fit before transforming data.");
 
         int rows = matrix.Rows;
-        int cols = matrix.Columns;
+        int cols = Math.Min(matrix.Columns, _means.Length);
+
+        if (matrix.IsColumnar)
+        {
+            if (!matrix.IsWritableColumnar)
+                throw new InvalidOperationException("Cannot transform a read-only columnar FeatureMatrix in-place. Construct FeatureMatrix with writable Memory<float>[] columns or a row-major buffer.");
+
+            for (int c = 0; c < cols; c++)
+            {
+                Span<float> col = matrix.GetWritableColumn(c);
+                float mean = _means[c];
+                float invStd = 1.0f / _stdDevs[c];
+                for (int r = 0; r < rows; r++)
+                {
+                    col[r] = (col[r] - mean) * invStd;
+                }
+            }
+            return;
+        }
 
         for (int r = 0; r < rows; r++)
         {

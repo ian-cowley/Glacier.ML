@@ -30,11 +30,24 @@ public sealed class MinMaxScaler : ITransformer
             float minVal = float.MaxValue;
             float maxVal = float.MinValue;
 
-            for (int r = 0; r < rows; r++)
+            if (matrix.IsColumnar)
             {
-                float v = matrix.GetValue(r, c);
-                if (v < minVal) minVal = v;
-                if (v > maxVal) maxVal = v;
+                ReadOnlySpan<float> col = matrix.GetColumn(c);
+                for (int r = 0; r < rows; r++)
+                {
+                    float v = col[r];
+                    if (v < minVal) minVal = v;
+                    if (v > maxVal) maxVal = v;
+                }
+            }
+            else
+            {
+                for (int r = 0; r < rows; r++)
+                {
+                    float v = matrix.GetValue(r, c);
+                    if (v < minVal) minVal = v;
+                    if (v > maxVal) maxVal = v;
+                }
             }
 
             _mins[c] = minVal;
@@ -51,6 +64,26 @@ public sealed class MinMaxScaler : ITransformer
             throw new InvalidOperationException("MinMaxScaler must be fit before transforming data.");
 
         int rows = matrix.Rows;
+        int cols = Math.Min(matrix.Columns, _mins.Length);
+
+        if (matrix.IsColumnar)
+        {
+            if (!matrix.IsWritableColumnar)
+                throw new InvalidOperationException("Cannot transform a read-only columnar FeatureMatrix in-place. Construct FeatureMatrix with writable Memory<float>[] columns or a row-major buffer.");
+
+            for (int c = 0; c < cols; c++)
+            {
+                Span<float> col = matrix.GetWritableColumn(c);
+                float minVal = _mins[c];
+                float invRange = 1.0f / _ranges[c];
+                for (int r = 0; r < rows; r++)
+                {
+                    col[r] = (col[r] - minVal) * invRange;
+                }
+            }
+            return;
+        }
+
         for (int r = 0; r < rows; r++)
         {
             Span<float> row = matrix.GetRowSpan(r);

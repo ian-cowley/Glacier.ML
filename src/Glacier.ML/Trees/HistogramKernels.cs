@@ -24,6 +24,10 @@ public static unsafe class HistogramKernels
     {
         int length = values.Length;
         int numThresholds = binThresholds.Length;
+        if (outputBins.Length < length)
+            throw new ArgumentException("Output bins span is smaller than input values.", nameof(outputBins));
+        if (numThresholds > 255)
+            throw new ArgumentOutOfRangeException(nameof(binThresholds), "At most 255 thresholds (256 byte bins) are supported.");
 
         fixed (float* pVal = values)
         fixed (float* pThresh = binThresholds)
@@ -33,12 +37,12 @@ public static unsafe class HistogramKernels
             {
                 float v = pVal[i];
                 // Linear / binary search for bin index
-                byte bin = 0;
+                int bin = 0;
                 while (bin < numThresholds && v > pThresh[bin])
                 {
                     bin++;
                 }
-                pOut[i] = bin;
+                pOut[i] = (byte)bin;
             }
         }
     }
@@ -52,6 +56,11 @@ public static unsafe class HistogramKernels
         ReadOnlySpan<float> gradients, 
         Span<float> outputHistogramGradients)
     {
+        if (gradients.Length < binnedFeature.Length)
+            throw new ArgumentException("Gradients span is smaller than binnedFeature.", nameof(gradients));
+        if (outputHistogramGradients.Length < 256)
+            throw new ArgumentException("Histogram gradient buffer must have at least 256 elements.", nameof(outputHistogramGradients));
+
         outputHistogramGradients.Clear();
         int length = binnedFeature.Length;
 
@@ -140,6 +149,13 @@ public static unsafe class HistogramKernels
         Span<float> outputHistogramGradients,
         Span<int> outputHistogramCounts)
     {
+        if (gradients.Length < binnedFeature.Length)
+            throw new ArgumentException("Gradients span is smaller than binnedFeature.", nameof(gradients));
+        if (outputHistogramGradients.Length < 256)
+            throw new ArgumentException("Histogram gradient buffer must have at least 256 elements.", nameof(outputHistogramGradients));
+        if (outputHistogramCounts.Length < 256)
+            throw new ArgumentException("Histogram count buffer must have at least 256 elements.", nameof(outputHistogramCounts));
+
         outputHistogramGradients.Clear();
         outputHistogramCounts.Clear();
         int length = binnedFeature.Length;
