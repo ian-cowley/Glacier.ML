@@ -344,4 +344,41 @@ public class KMeansTests
         // Verify deterministic positive throughput without wall-clock flakiness on shared CI VMs
         Assert.True(samplesPerSec > 0, $"Throughput was {samplesPerSec:N0} samples/sec (elapsed {elapsedMs:F3} ms)");
     }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void KMeansKernels_Dim2And3_MatchScalarGroundTruthAcrossCentroidCounts(int dim)
+    {
+        var rng = new Random(99 + dim);
+        int[] counts = [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 65];
+        foreach (int k in counts)
+        {
+            float[] centroids = new float[k * dim];
+            float[] sample = new float[dim];
+            for (int i = 0; i < centroids.Length; i++) centroids[i] = (float)(rng.NextDouble() * 20.0 - 10.0);
+            for (int i = 0; i < dim; i++) sample[i] = (float)(rng.NextDouble() * 20.0 - 10.0);
+
+            int actual = KMeansKernels.FindNearestCentroid(sample, centroids, k, dim);
+
+            int expected = 0;
+            float best = float.MaxValue;
+            for (int c = 0; c < k; c++)
+            {
+                float d = 0f;
+                for (int j = 0; j < dim; j++)
+                {
+                    float diff = sample[j] - centroids[c * dim + j];
+                    d += diff * diff;
+                }
+                if (d < best)
+                {
+                    best = d;
+                    expected = c;
+                }
+            }
+
+            Assert.Equal(expected, actual);
+        }
+    }
 }

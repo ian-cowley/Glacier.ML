@@ -3,7 +3,8 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
+    <PackageReleaseNotes>v1.1.1: Vector256/Vector128 SIMD KMeans D=2/D=3 centroid kernels, tree feature subsampling fixes, and aligned Gpu/Polaris dependencies.</PackageReleaseNotes>
     <PackageId>Glacier.ML</PackageId>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier</Company>
@@ -25,7 +26,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Glacier.Polaris" Version="1.1.0" />
-    <PackageReference Include="Glacier.Gpu" Version="1.1.0" />
+    <PackageReference Include="Glacier.Polaris" Version="1.2.6" />
+    <PackageReference Include="Glacier.Gpu" Version="1.2.1" />
   </ItemGroup>
 </Project>

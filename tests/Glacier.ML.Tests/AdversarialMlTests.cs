@@ -91,4 +91,20 @@ public class AdversarialMlTests
         treeIdentical.Predict(matIdentical, predIdentical);
         for (int i = 0; i < 50; i++) Assert.Equal(1.0f, predIdentical[i]);
     }
+
+    [Fact]
+    public void FeatureMatrix_ColumnarGetRow_DoesNotAliasAcrossConcurrentRows()
+    {
+        float[] col0 = [1f, 2f, 3f];
+        float[] col1 = [10f, 20f, 30f];
+        using var matrix = new FeatureMatrix(new ReadOnlyMemory<float>[] { col0, col1 });
+
+        var row0 = matrix.GetRow(0);
+        var row1 = matrix.GetRow(1);
+
+        Assert.Equal(1f, row0[0]);
+        Assert.Equal(10f, row0[1]);
+        Assert.Equal(2f, row1[0]);
+        Assert.Equal(20f, row1[1]);
+    }
 }

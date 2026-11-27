@@ -39,6 +39,7 @@ public sealed class FastRandomForest : IPredictor
         int totalRows = features.Rows;
         int totalCols = features.Columns;
         int sampleSize = Math.Max(2, (int)(totalRows * _subsampleRatio));
+        int maxFeatures = totalCols <= 1 ? totalCols : Math.Max(1, (int)MathF.Sqrt(totalCols));
 
         _trees = new FastDecisionTree[_numTrees];
 
@@ -57,9 +58,24 @@ public sealed class FastRandomForest : IPredictor
                     bootstrapIndices[s] = rng.Next(0, totalRows);
                 }
 
+                // Feature subsampling (sqrt(p)) for true Random Forest decorrelation
+                int[]? selectedFeatures = null;
+                if (totalCols > 1)
+                {
+                    int[] allCols = new int[totalCols];
+                    for (int c = 0; c < totalCols; c++) allCols[c] = c;
+                    for (int c = 0; c < maxFeatures; c++)
+                    {
+                        int swapIdx = rng.Next(c, totalCols);
+                        (allCols[c], allCols[swapIdx]) = (allCols[swapIdx], allCols[c]);
+                    }
+                    selectedFeatures = new int[maxFeatures];
+                    Array.Copy(allCols, selectedFeatures, maxFeatures);
+                }
+
                 var tree = new FastDecisionTree(_maxDepth, _minSamplesSplit);
                 var targetsSpan = new ReadOnlySpan<float>((float*)targetsPtr, totalRows);
-                tree.Fit(features, targetsSpan, sampleIndices: bootstrapIndices);
+                tree.Fit(features, targetsSpan, sampleIndices: bootstrapIndices, featureIndices: selectedFeatures);
                 _trees[t] = tree;
             });
         }

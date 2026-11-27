@@ -41,8 +41,30 @@ public static unsafe class KMeansKernels
         float s1 = pSample[1];
         int bestCluster = 0;
         float minDistance = float.MaxValue;
+        int k = 0;
 
-        for (int k = 0; k < numCentroids; k++)
+        if (Vector256.IsHardwareAccelerated && numCentroids >= 4)
+        {
+            var vSample = Vector256.Create(s0, s1, s0, s1, s0, s1, s0, s1);
+            int limit4 = numCentroids - 4;
+            for (; k <= limit4; k += 4)
+            {
+                var vC = Vector256.Load(pCentroids + (k * 2));
+                var diff = vSample - vC;
+                var sq = diff * diff;
+                float d0 = sq.GetElement(0) + sq.GetElement(1);
+                float d1 = sq.GetElement(2) + sq.GetElement(3);
+                float d2 = sq.GetElement(4) + sq.GetElement(5);
+                float d3 = sq.GetElement(6) + sq.GetElement(7);
+
+                if (d0 < minDistance) { minDistance = d0; bestCluster = k; }
+                if (d1 < minDistance) { minDistance = d1; bestCluster = k + 1; }
+                if (d2 < minDistance) { minDistance = d2; bestCluster = k + 2; }
+                if (d3 < minDistance) { minDistance = d3; bestCluster = k + 3; }
+            }
+        }
+
+        for (; k < numCentroids; k++)
         {
             float* pC = pCentroids + (k * 2);
             float diff0 = s0 - pC[0];
@@ -65,8 +87,27 @@ public static unsafe class KMeansKernels
         float s2 = pSample[2];
         int bestCluster = 0;
         float minDistance = float.MaxValue;
+        int k = 0;
 
-        for (int k = 0; k < numCentroids; k++)
+        if (Vector128.IsHardwareAccelerated && numCentroids >= 2)
+        {
+            var vSample = Vector128.Create(s0, s1, s2, 0f);
+            var mask = Vector128.Create(0xFFFF_FFFFu, 0xFFFF_FFFFu, 0xFFFF_FFFFu, 0u).AsSingle();
+            int safeLimit = numCentroids - 1;
+            for (; k < safeLimit; k++)
+            {
+                var vC = Vector128.Load(pCentroids + (k * 3));
+                var diff = Vector128.BitwiseAnd(vSample - vC, mask);
+                float dist = Vector128.Dot(diff, diff);
+                if (dist < minDistance)
+                {
+                    minDistance = dist;
+                    bestCluster = k;
+                }
+            }
+        }
+
+        for (; k < numCentroids; k++)
         {
             float* pC = pCentroids + (k * 3);
             float diff0 = s0 - pC[0];

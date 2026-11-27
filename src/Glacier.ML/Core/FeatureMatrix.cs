@@ -21,9 +21,6 @@ public sealed unsafe class FeatureMatrix : IDisposable
     private readonly string[]? _featureNames;
     private bool _disposed;
 
-    [ThreadStatic]
-    private static float[]? t_rowBuffer;
-
     public bool IsDisposed => _disposed;
     public int Rows => _rows;
     public int Columns => _cols;
@@ -207,15 +204,9 @@ public sealed unsafe class FeatureMatrix : IDisposable
 
         if (_columnarMemories != null)
         {
-            if (t_rowBuffer == null || t_rowBuffer.Length < _cols)
-            {
-                t_rowBuffer = new float[_cols];
-            }
-            for (int c = 0; c < _cols; c++)
-            {
-                t_rowBuffer[c] = _columnarMemories[c].Span[rowIndex];
-            }
-            return new ReadOnlySpan<float>(t_rowBuffer, 0, _cols);
+            float[] row = new float[_cols];
+            CopyRowTo(rowIndex, row);
+            return row;
         }
         else if (_nativeData != null)
         {
@@ -224,6 +215,30 @@ public sealed unsafe class FeatureMatrix : IDisposable
         else
         {
             return _data.AsSpan(rowIndex * _cols, _cols);
+        }
+    }
+
+    public unsafe void CopyRowTo(int rowIndex, Span<float> destination)
+    {
+        if ((uint)rowIndex >= (uint)_rows)
+            throw new ArgumentOutOfRangeException(nameof(rowIndex));
+        if (destination.Length < _cols)
+            throw new ArgumentException($"Destination span length ({destination.Length}) must be at least {_cols}.", nameof(destination));
+
+        if (_columnarMemories != null)
+        {
+            for (int c = 0; c < _cols; c++)
+            {
+                destination[c] = _columnarMemories[c].Span[rowIndex];
+            }
+        }
+        else if (_nativeData != null)
+        {
+            new ReadOnlySpan<float>(_nativeData + (long)rowIndex * _cols, _cols).CopyTo(destination);
+        }
+        else
+        {
+            _data.AsSpan(rowIndex * _cols, _cols).CopyTo(destination);
         }
     }
 
