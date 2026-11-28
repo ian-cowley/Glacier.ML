@@ -6,22 +6,23 @@ namespace Glacier.ML.Core;
 public enum GpuTarget
 {
     /// <summary>
-    /// Automatically selects the best available hardware (NVIDIA RTX 4060 dGPU, AMD Radeon 890M APU, or SIMD CPU).
+    /// Automatically selects NVIDIA CUDA when supported for the operation and batch size, otherwise SIMD CPU.
     /// </summary>
     Auto = 0,
 
     /// <summary>
-    /// Targets bare-metal NVIDIA CUDA acceleration (RTX 4060 / Ada Lovelace).
+    /// Targets bare-metal NVIDIA CUDA acceleration where supported (KMeans assignment and ring-buffer vector ops).
+    /// CPU-only operations throw <see cref="System.NotSupportedException"/> if explicitly forced to Nvidia.
     /// </summary>
     Nvidia = 1,
 
     /// <summary>
-    /// Targets bare-metal AMD ROCm/HIP acceleration (Radeon 890M / RDNA 3.5).
+    /// Reserved for AMD ROCm/HIP acceleration (currently unsupported in Glacier.ML; throws <see cref="System.NotSupportedException"/>).
     /// </summary>
     Amd = 2,
 
     /// <summary>
-    /// Distributes workload dynamically across both GPUs if available.
+    /// Reserved for dual-GPU workload distribution (currently unsupported in Glacier.ML; throws <see cref="System.NotSupportedException"/>).
     /// </summary>
     DualGpu = 3,
 

@@ -10,6 +10,7 @@ using Xunit;
 public class AdversarialMlTests
 {
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void GpuMlStreamContext_ConcurrentMultiThreadedStressTest()
     {
         if (!GpuMlAccelerator.IsNvidiaAvailable) return;

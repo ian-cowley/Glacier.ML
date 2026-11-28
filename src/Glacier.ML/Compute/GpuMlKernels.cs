@@ -194,68 +194,6 @@ $L__BB0_18:
 	ret;
 
 }
-	// .globl	vector_sigmoid_fp32
-.visible .entry vector_sigmoid_fp32(
-	.param .u64 vector_sigmoid_fp32_param_0,
-	.param .u64 vector_sigmoid_fp32_param_1,
-	.param .f32 vector_sigmoid_fp32_param_2,
-	.param .u32 vector_sigmoid_fp32_param_3
-)
-{
-	.reg .pred 	%p<4>;
-	.reg .f32 	%f<8>;
-	.reg .b32 	%r<8>;
-	.reg .b64 	%rd<8>;
-
-
-	ld.param.u64 	%rd2, [vector_sigmoid_fp32_param_0];
-	ld.param.u64 	%rd3, [vector_sigmoid_fp32_param_1];
-	ld.param.f32 	%f2, [vector_sigmoid_fp32_param_2];
-	ld.param.u32 	%r2, [vector_sigmoid_fp32_param_3];
-	mov.u32 	%r3, %ctaid.x;
-	mov.u32 	%r4, %ntid.x;
-	mov.u32 	%r5, %tid.x;
-	mad.lo.s32 	%r1, %r4, %r3, %r5;
-	setp.ge.s32 	%p1, %r1, %r2;
-	@%p1 bra 	$L__BB1_6;
-
-	cvta.to.global.u64 	%rd4, %rd2;
-	mul.wide.s32 	%rd5, %r1, 4;
-	add.s64 	%rd6, %rd4, %rd5;
-	ld.global.nc.f32 	%f3, [%rd6];
-	add.f32 	%f1, %f3, %f2;
-	setp.gt.f32 	%p2, %f1, 0f41A00000;
-	cvta.to.global.u64 	%rd7, %rd3;
-	add.s64 	%rd1, %rd7, %rd5;
-	@%p2 bra 	$L__BB1_5;
-	bra.uni 	$L__BB1_2;
-
-$L__BB1_5:
-	mov.u32 	%r7, 1065353216;
-	st.global.u32 	[%rd1], %r7;
-	bra.uni 	$L__BB1_6;
-
-$L__BB1_2:
-	setp.lt.f32 	%p3, %f1, 0fC1A00000;
-	@%p3 bra 	$L__BB1_4;
-	bra.uni 	$L__BB1_3;
-
-$L__BB1_4:
-	mov.u32 	%r6, 0;
-	st.global.u32 	[%rd1], %r6;
-	bra.uni 	$L__BB1_6;
-
-$L__BB1_3:
-	mul.f32 	%f4, %f1, 0fBFB8AA3B;
-	ex2.approx.f32 	%f5, %f4;
-	add.f32 	%f6, %f5, 0f3F800000;
-	rcp.rn.f32 	%f7, %f6;
-	st.global.f32 	[%rd1], %f7;
-
-$L__BB1_6:
-	ret;
-
-}
 
 ";
 }

@@ -59,4 +59,69 @@ public class LinearModelTests
         Assert.True(model.PredictProbability(strongPositive) > 0.7f);
         Assert.True(model.PredictProbability(strongNegative) < 0.3f);
     }
+
+    [Fact]
+    public void FastLogisticRegression_ValidationAndColumnarZeroRawArray_Works()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new FastLogisticRegression(learningRate: 0f));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new FastLogisticRegression(learningRate: float.NaN));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new FastLogisticRegression(epochs: 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new FastLogisticRegression(l2Regularization: -0.1f));
+
+        var unfitted = new FastLogisticRegression();
+        using var rowMat = new FeatureMatrix(4, 2);
+        Assert.Throws<InvalidOperationException>(() => unfitted.Predict(rowMat, new float[4]));
+        Assert.Throws<InvalidOperationException>(() => unfitted.PredictRow(new float[2]));
+        Assert.Throws<InvalidOperationException>(() => unfitted.PredictProbability(new float[2]));
+
+        // Columnar SGD (< 1024) + Columnar Batch (>= 1024) must keep _data == null
+        var dataField = typeof(FeatureMatrix).GetField("_data", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        const int smallN = 100;
+        float[] sc0 = new float[smallN];
+        float[] sc1 = new float[smallN];
+        float[] sy = new float[smallN];
+        for (int i = 0; i < smallN; i++)
+        {
+            sc0[i] = i < 50 ? -2f : 2f;
+            sc1[i] = i < 50 ? -1f : 1f;
+            sy[i] = i < 50 ? 0f : 1f;
+        }
+        using var smallCol = new FeatureMatrix(new ReadOnlyMemory<float>[] { sc0, sc1 });
+        var logSmall = new FastLogisticRegression(learningRate: 0.2f, epochs: 30);
+        logSmall.Fit(smallCol, sy);
+        Assert.Null(dataField?.GetValue(smallCol));
+
+        float[] smallPreds = new float[smallN];
+        logSmall.Predict(smallCol, smallPreds);
+        Assert.Null(dataField?.GetValue(smallCol));
+        Assert.Equal(1.0f, Metrics.Accuracy(sy, smallPreds), precision: 3);
+
+        // Short / mismatched vectors must throw ArgumentException instead of silently truncating
+        Assert.Throws<ArgumentException>(() => logSmall.PredictRow(new float[] { 1.0f }));
+        Assert.Throws<ArgumentException>(() => logSmall.PredictProbability(new float[] { 1.0f }));
+        Assert.Throws<ArgumentException>(() => logSmall.PredictRow(new float[] { 1.0f, 2.0f, 3.0f }));
+        Assert.Throws<ArgumentException>(() => logSmall.Predict(new FeatureMatrix(4, 3), new float[4]));
+
+        const int largeN = 1200;
+        float[] lc0 = new float[largeN];
+        float[] lc1 = new float[largeN];
+        float[] ly = new float[largeN];
+        for (int i = 0; i < largeN; i++)
+        {
+            lc0[i] = i % 2 == 0 ? -3f : 3f;
+            lc1[i] = i % 2 == 0 ? -1f : 1f;
+            ly[i] = i % 2 == 0 ? 0f : 1f;
+        }
+        using var largeCol = new FeatureMatrix(new ReadOnlyMemory<float>[] { lc0, lc1 });
+        var logLarge = new FastLogisticRegression(learningRate: 0.2f, epochs: 30);
+        logLarge.Fit(largeCol, ly);
+        Assert.Null(dataField?.GetValue(largeCol));
+
+        float[] largePreds = new float[largeN];
+        logLarge.Predict(largeCol, largePreds);
+        Assert.Null(dataField?.GetValue(largeCol));
+        Assert.Equal(1.0f, Metrics.Accuracy(ly, largePreds), precision: 3);
+
+        Assert.Throws<NotSupportedException>(() => new FastLogisticRegression(target: GpuTarget.Nvidia).Fit(rowMat, new float[4]));
+    }
 }

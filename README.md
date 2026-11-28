@@ -19,8 +19,8 @@
 ## 🚀 Key Highlights
 
 - **Hardware-Accelerated Kernels**: Saturated vectorization using `Vector512<float>`, `Vector256<float>`, `Vector128<float>`, and `AdvSimd` for dot products, squared Euclidean distances, and vector reductions.
-- **Bare-Metal GPU Acceleration**: Direct P/Invoke CUDA Driver execution (`nvcuda.dll`) offloading K-Means cluster assignment and persistent ring-buffer vector kernels (`VectorAdd` / `VectorFma`) to NVIDIA GPUs (`sm_75+`) without CUDA SDK runtime dependencies, with automatic SIMD CPU fallback.
-- **Dynamic Hardware Target Scaling**: Select between `GpuTarget.Auto`, `GpuTarget.Nvidia`, and `GpuTarget.Cpu` dynamically based on batch sizes and hardware availability.
+- **Bare-Metal GPU Acceleration**: Direct P/Invoke CUDA Driver execution (`nvcuda.dll`) offloading K-Means cluster assignment (`kmeans_assign_fp32`) and persistent ring-buffer vector kernels (`VectorAdd` / `VectorFma`, `>= 65,536` elements under `Auto`) to NVIDIA GPUs (`sm_75+`) without CUDA SDK runtime dependencies, with automatic SIMD CPU fallback.
+- **Dynamic Hardware Target Scaling**: Select between `GpuTarget.Auto`, `GpuTarget.Nvidia`, and `GpuTarget.Cpu` dynamically based on batch sizes and hardware availability (`GpuTarget.Amd` and `GpuTarget.DualGpu` throw `NotSupportedException` in `Glacier.ML`).
 - **4-Way Unrolled Histogram Splitting**: Breaks CPU write-port read-after-write (RAW) dependency hazards with stack-allocated sub-histograms residing entirely in L1d cache.
 - **Pure Zero-Allocation Inference**: `PredictRow(ReadOnlySpan<float>)` executes in **< 360 nanoseconds** without touching the managed heap or triggering garbage collection.
 - **Multi-Core Parallelism**: Trains Random Forest ensembles and assigns KMeans clusters across all logical CPU cores and GPU streaming multiprocessors without GIL bottlenecks.
@@ -38,9 +38,9 @@
 | **KMeans Batch Predict** | 100,000 samples × 8 features | ~42 ms | 5.6 ms | **< 1.0 ms (0.5 ms)** | **> 80x** |
 | **KMeans Batch Predict (Fleet)** | 50,000 samples × 10 features | 0.80 ms (62.3M/s) | **0.46 ms (109.9M/s)** | — | **1.76x faster** |
 | **KMeans Fit** | 100,000 rows × 8 features ($k=8$, 20 iters) | ~680 ms | 180 ms | **127 ms** | **5.3x** |
-| **FastLinearRegression Inference** | 100,000 samples | ~35 ms | 6 ms | **1 ms** | **35x** |
-| **FastPCA Covariance ($X^T X$)** | 100,000 samples × 64 dims | ~120 ms | 35 ms | **14 ms** | **8.5x** |
-| **FastPCA 3D Projection** | 100,000 samples | ~45 ms | 18 ms | **7 ms** | **6.4x** |
+| **FastLinearRegression Inference** | 100,000 samples | ~35 ms | **6 ms** | — *(CPU SIMD)* | **5.8x** |
+| **FastPCA Covariance ($X^T X$)** | 100,000 samples × 64 dims | ~120 ms | **35 ms** | — *(CPU SIMD)* | **3.4x** |
+| **FastPCA 3D Projection** | 100,000 samples | ~45 ms | **18 ms** | — *(CPU SIMD)* | **2.5x** |
 | **Random Forest Fit** | 100,000 rows, 50 trees, depth 8 | ~14,200 ms | **3,603 ms** | — | **3.9x** |
 | **Single-Sample Inference** | Zero-alloc `PredictRow` | ~150,000 ns | **352 ns** | — | **426x** |
 
@@ -153,11 +153,11 @@ dotnet run --project samples/Glacier.ML.Demo/Glacier.ML.Demo.csproj -c Release
 
 ---
 
-## 🆕 What's New in v1.1.0
+## 🆕 What's New in v1.1.1
 
-- **True Zero-Copy Writable Columnar Transforms** — `StandardScaler`, `MinMaxScaler`, and `OneHotEncoder` now transform writable columnar `FeatureMatrix(Memory<float>[])` instances directly in-place and guard read-only columnar views against silent mutation loss.
-- **Hardened CUDA Stream & Persistent Ring Buffer Lifecycle** — Per-thread CUDA context binding on `GpuMlStreamContext`, lockstep PTX `.version` / `.target` normalization via `Glacier.Gpu 1.1.0`, and barrier-safe persistent ring buffer host-mapped memory management.
-- **Strict Native AOT & Bounds Hygiene** — Full `IsAotCompatible` + `TreatWarningsAsErrors` verification, hardened kernel span bounds checks, and `Glacier.Polaris 1.1.0` + `Glacier.Gpu 1.1.0` integration.
+- **Hardened Numerical & Algorithm Core** — Histogram-backed `SplitFinder`, empty-cluster relocation/preservation and safe `PredictRow` bounds in `KMeans`, double-precision covariance + Symmetric Cyclic Jacobi eigendecomposition in `FastPCA`, true zero-bias OLS + double Cholesky/Jacobi pseudoinverse in `FastLinearRegression`, and strict Polaris `ValidityMask` null handling (`PolarisNullHandling`).
+- **Honest GPU Scope & Safe CUDA Driver Lifecycle** — `GpuMlAccelerator` validates every `CuDriver` return code, uses overflow-safe `long`/`nuint` sizes, rolls back partial `EnsureVectorBuffers` pinned allocations, dispatches `Auto` ring-buffer ops at `>= 65,536` elements, and explicitly throws `NotSupportedException` for unsupported GPU targets.
+- **Strict Native AOT & Standalone CI** — Full `IsAotCompatible` + `TreatWarningsAsErrors` verification, conditional `ProjectReference`/`PackageReference` support (`Glacier.Polaris 1.2.6`, `Glacier.Gpu 1.2.1`), and `[Trait("Hardware", "Gpu")]` test filtering.
 
 ---
 

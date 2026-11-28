@@ -283,6 +283,63 @@ public static unsafe class KMeansKernels
         return sum;
     }
 
+    /// <summary>
+    /// Exact SIMD batch nearest-centroid assignment evaluating <c>(x - c)^2</c> without float32 norm-decomposition cancellation.
+    /// Safe across arbitrary coordinate offsets and scales.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void PredictBatchExact(
+        ReadOnlySpan<float> data,
+        ReadOnlySpan<float> centroids,
+        int startRow,
+        int endRow,
+        int cols,
+        int k,
+        Span<int> assignments)
+    {
+        if (startRow < 0 || endRow < startRow)
+            throw new ArgumentOutOfRangeException(nameof(startRow), "Invalid row range.");
+        if (cols <= 0 || k <= 0)
+            throw new ArgumentOutOfRangeException(nameof(cols), "Dimensions and centroid count must be positive.");
+        if (data.Length < (long)endRow * cols)
+            throw new ArgumentException("Data span is smaller than required rows.", nameof(data));
+        if (centroids.Length < (long)k * cols)
+            throw new ArgumentException("Centroids span is smaller than k * cols.", nameof(centroids));
+        if (assignments.Length < endRow)
+            throw new ArgumentException("Assignments span is smaller than endRow.", nameof(assignments));
+
+        fixed (float* pData = data)
+        fixed (float* pCent = centroids)
+        fixed (int* pAssign = assignments)
+        {
+            PredictBatchExact(pData, pCent, startRow, endRow, cols, k, pAssign);
+        }
+    }
+
+    /// <summary>
+    /// Exact SIMD batch nearest-centroid assignment evaluating <c>(x - c)^2</c> without float32 norm-decomposition cancellation.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void PredictBatchExact(
+        float* pData,
+        float* pCentroids,
+        int startRow,
+        int endRow,
+        int cols,
+        int k,
+        int* pAssignments)
+    {
+        for (int r = startRow; r < endRow; r++)
+        {
+            pAssignments[r] = FindNearestCentroid(pData + ((long)r * cols), pCentroids, k, cols);
+        }
+    }
+
+    /// <summary>
+    /// Decomposed nearest-centroid assignment using <c>||c||^2 - 2&lt;x, c&gt;</c> in float32.
+    /// Note: Susceptible to float32 catastrophic cancellation at large coordinate offsets (e.g. &gt;= 1000).
+    /// Prefer <see cref="PredictBatchExact(ReadOnlySpan{float}, ReadOnlySpan{float}, int, int, int, int, Span{int})"/> for general prediction.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void PredictBatchDecomposed(
         ReadOnlySpan<float> data,
@@ -303,6 +360,11 @@ public static unsafe class KMeansKernels
         }
     }
 
+    /// <summary>
+    /// Decomposed nearest-centroid assignment using <c>||c||^2 - 2&lt;x, c&gt;</c> in float32.
+    /// Note: Susceptible to float32 catastrophic cancellation at large coordinate offsets (e.g. &gt;= 1000).
+    /// Prefer <see cref="PredictBatchExact(ReadOnlySpan{float}, ReadOnlySpan{float}, int, int, int, int, Span{int})"/> for general prediction.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void PredictBatchDecomposed(
         float* pData,

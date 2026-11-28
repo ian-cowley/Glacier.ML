@@ -31,19 +31,27 @@ public sealed unsafe class FeatureMatrix : IDisposable
 
     public unsafe float* NativePointer => _nativeData;
 
-    public ReadOnlyMemory<float> Memory => _data != null 
-        ? _data.AsMemory(0, _rows * _cols) 
-        : RawArray.AsMemory(0, _rows * _cols);
+    public ReadOnlyMemory<float> Memory
+    {
+        get
+        {
+            int total = checked(_rows * _cols);
+            return _data != null
+                ? _data.AsMemory(0, total)
+                : RawArray.AsMemory(0, total);
+        }
+    }
 
     public unsafe ReadOnlySpan<float> Span
     {
         get
         {
+            int total = checked(_rows * _cols);
             if (_nativeData != null)
-                return new ReadOnlySpan<float>(_nativeData, _rows * _cols);
+                return new ReadOnlySpan<float>(_nativeData, total);
             if (_data != null)
-                return _data.AsSpan(0, _rows * _cols);
-            return RawArray.AsSpan(0, _rows * _cols);
+                return _data.AsSpan(0, total);
+            return RawArray.AsSpan(0, total);
         }
     }
 
@@ -54,10 +62,13 @@ public sealed unsafe class FeatureMatrix : IDisposable
     {
         if (rows <= 0) throw new ArgumentOutOfRangeException(nameof(rows), "Rows must be positive.");
         if (cols <= 0) throw new ArgumentOutOfRangeException(nameof(cols), "Columns must be positive.");
+        long totalLong = (long)rows * cols;
+        if (totalLong > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(rows), "Matrix element count exceeds Int32.MaxValue.");
 
         _rows = rows;
         _cols = cols;
-        _data = GC.AllocateArray<float>(rows * cols, pinned: true);
+        _data = GC.AllocateArray<float>((int)totalLong, pinned: true);
         _featureNames = featureNames;
     }
 
@@ -67,7 +78,7 @@ public sealed unsafe class FeatureMatrix : IDisposable
     public FeatureMatrix(float[] data, int rows, int cols, string[]? featureNames = null)
     {
         if (data == null) throw new ArgumentNullException(nameof(data));
-        if (rows <= 0 || cols <= 0 || data.Length < rows * cols)
+        if (rows <= 0 || cols <= 0 || (long)rows * cols > data.Length)
             throw new ArgumentException("Data length does not match specified dimensions.");
 
         _rows = rows;
@@ -86,6 +97,8 @@ public sealed unsafe class FeatureMatrix : IDisposable
 
         _cols = columns.Length;
         _rows = columns[0].Length;
+        if ((long)_rows * _cols > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(columns), "Matrix element count exceeds Int32.MaxValue.");
         for (int c = 1; c < _cols; c++)
         {
             if (columns[c].Length != _rows)
@@ -106,6 +119,8 @@ public sealed unsafe class FeatureMatrix : IDisposable
 
         _cols = columns.Length;
         _rows = columns[0].Length;
+        if ((long)_rows * _cols > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(columns), "Matrix element count exceeds Int32.MaxValue.");
         var roColumns = new ReadOnlyMemory<float>[_cols];
         var rwColumns = new Memory<float>[_cols];
         for (int c = 0; c < _cols; c++)
@@ -135,6 +150,8 @@ public sealed unsafe class FeatureMatrix : IDisposable
         if (nativeData == null) throw new ArgumentNullException(nameof(nativeData));
         if (rows <= 0) throw new ArgumentOutOfRangeException(nameof(rows));
         if (cols <= 0) throw new ArgumentOutOfRangeException(nameof(cols));
+        if ((long)rows * cols > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(rows), "Matrix element count exceeds Int32.MaxValue.");
 
         _nativeData = nativeData;
         _rows = rows;
@@ -179,6 +196,21 @@ public sealed unsafe class FeatureMatrix : IDisposable
         throw new InvalidOperationException("FeatureMatrix is not backed by writable columnar memory.");
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal Memory<float> GetWritableColumnMemory(int colIndex)
+    {
+        if ((uint)colIndex >= (uint)_cols)
+            throw new ArgumentOutOfRangeException(nameof(colIndex));
+
+        if (_writableColumnarMemories != null)
+        {
+            _data = null;
+            return _writableColumnarMemories[colIndex];
+        }
+
+        throw new InvalidOperationException("FeatureMatrix is not backed by writable columnar memory.");
+    }
+
     /// <summary>
     /// Returns the column memory slice for columnar FeatureMatrix.
     /// </summary>
@@ -214,7 +246,7 @@ public sealed unsafe class FeatureMatrix : IDisposable
         }
         else
         {
-            return _data.AsSpan(rowIndex * _cols, _cols);
+            return _data.AsSpan(checked((int)((long)rowIndex * _cols)), _cols);
         }
     }
 
@@ -238,7 +270,7 @@ public sealed unsafe class FeatureMatrix : IDisposable
         }
         else
         {
-            _data.AsSpan(rowIndex * _cols, _cols).CopyTo(destination);
+            _data.AsSpan(checked((int)((long)rowIndex * _cols)), _cols).CopyTo(destination);
         }
     }
 
@@ -258,7 +290,7 @@ public sealed unsafe class FeatureMatrix : IDisposable
         }
         else
         {
-            return _data.AsSpan(rowIndex * _cols, _cols);
+            return _data.AsSpan(checked((int)((long)rowIndex * _cols)), _cols);
         }
     }
 
@@ -275,7 +307,7 @@ public sealed unsafe class FeatureMatrix : IDisposable
         }
         else
         {
-            return _data![row * _cols + col];
+            return _data![checked((int)((long)row * _cols + col))];
         }
     }
 
@@ -297,7 +329,7 @@ public sealed unsafe class FeatureMatrix : IDisposable
         }
         else
         {
-            _data![row * _cols + col] = value;
+            _data![checked((int)((long)row * _cols + col))] = value;
         }
     }
 
@@ -326,7 +358,7 @@ public sealed unsafe class FeatureMatrix : IDisposable
         {
             for (int r = 0; r < _rows; r++)
             {
-                destination[r] = _data![r * _cols + colIndex];
+                destination[r] = _data![checked((int)((long)r * _cols + colIndex))];
             }
         }
     }
@@ -340,7 +372,11 @@ public sealed unsafe class FeatureMatrix : IDisposable
         {
             if (_data != null) return _data;
 
-            var arr = GC.AllocateArray<float>(_rows * _cols, pinned: true);
+            long total = (long)_rows * _cols;
+            if (total > int.MaxValue)
+                throw new InvalidOperationException("Matrix element count exceeds Int32.MaxValue.");
+
+            var arr = GC.AllocateArray<float>((int)total, pinned: true);
             if (_columnarMemories != null)
             {
                 for (int c = 0; c < _cols; c++)
@@ -348,7 +384,7 @@ public sealed unsafe class FeatureMatrix : IDisposable
                     var colSpan = _columnarMemories[c].Span;
                     for (int r = 0; r < _rows; r++)
                     {
-                        arr[r * _cols + c] = colSpan[r];
+                        arr[(long)r * _cols + c] = colSpan[r];
                     }
                 }
             }
@@ -356,7 +392,8 @@ public sealed unsafe class FeatureMatrix : IDisposable
             {
                 fixed (float* pArr = arr)
                 {
-                    Buffer.MemoryCopy(_nativeData, pArr, (long)_rows * _cols * sizeof(float), (long)_rows * _cols * sizeof(float));
+                    long bytes = total * sizeof(float);
+                    Buffer.MemoryCopy(_nativeData, pArr, bytes, bytes);
                 }
             }
 

@@ -7,19 +7,21 @@ using Glacier.ML.Core;
 namespace Glacier.ML.Trees;
 
 /// <summary>
-/// Multi-threaded Random Forest ensemble classifier outperforming Scikit-Learn.
+/// Multi-threaded Random Forest binary classifier (<c>target &gt; 0.5f</c> -&gt; 1.0f, else 0.0f) outperforming Scikit-Learn.
 /// Trains trees concurrently across CPU cores without the Python GIL.
 /// </summary>
-public sealed class FastRandomForest : IPredictor
+public sealed class FastRandomForest : IPredictor, IEstimator<FastRandomForest>
 {
     private readonly int _numTrees;
     private readonly int _maxDepth;
     private readonly int _minSamplesSplit;
     private readonly float _subsampleRatio;
     private FastDecisionTree[] _trees = Array.Empty<FastDecisionTree>();
+    private int _nFeatures;
 
     public int NumTrees => _numTrees;
     public int MaxDepth => _maxDepth;
+    public int NFeatures => _nFeatures;
     public FastDecisionTree[] Trees => _trees;
 
     public FastRandomForest(
@@ -28,17 +30,36 @@ public sealed class FastRandomForest : IPredictor
         int minSamplesSplit = 2,
         float subsampleRatio = 0.8f)
     {
-        _numTrees = Math.Max(1, numTrees);
+        if (numTrees <= 0) throw new ArgumentOutOfRangeException(nameof(numTrees), "NumTrees must be positive.");
+        if (maxDepth <= 0) throw new ArgumentOutOfRangeException(nameof(maxDepth), "MaxDepth must be positive.");
+        if (minSamplesSplit < 2) throw new ArgumentOutOfRangeException(nameof(minSamplesSplit), "MinSamplesSplit must be at least 2.");
+        if (!float.IsFinite(subsampleRatio) || subsampleRatio <= 0f || subsampleRatio > 1.0f)
+            throw new ArgumentOutOfRangeException(nameof(subsampleRatio), "SubsampleRatio must be in (0, 1].");
+
+        _numTrees = numTrees;
         _maxDepth = maxDepth;
         _minSamplesSplit = minSamplesSplit;
-        _subsampleRatio = Math.Clamp(subsampleRatio, 0.1f, 1.0f);
+        _subsampleRatio = subsampleRatio;
+    }
+
+    FastRandomForest IEstimator<FastRandomForest>.Fit(FeatureMatrix features, ReadOnlySpan<float> targets)
+    {
+        Fit(features, targets);
+        return this;
     }
 
     public unsafe void Fit(FeatureMatrix features, ReadOnlySpan<float> targets)
     {
+        ArgumentNullException.ThrowIfNull(features);
         int totalRows = features.Rows;
         int totalCols = features.Columns;
-        int sampleSize = Math.Max(2, (int)(totalRows * _subsampleRatio));
+        if (totalRows <= 0)
+            throw new ArgumentException("FeatureMatrix must contain at least one row.", nameof(features));
+        if (targets.Length < totalRows)
+            throw new ArgumentException("Targets length must match or exceed feature rows.", nameof(targets));
+
+        _nFeatures = totalCols;
+        int sampleSize = Math.Max(1, (int)(totalRows * _subsampleRatio));
         int maxFeatures = totalCols <= 1 ? totalCols : Math.Max(1, (int)MathF.Sqrt(totalCols));
 
         _trees = new FastDecisionTree[_numTrees];
@@ -84,7 +105,15 @@ public sealed class FastRandomForest : IPredictor
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Predict(FeatureMatrix features, Span<float> predictions)
     {
+        ArgumentNullException.ThrowIfNull(features);
+        if (_trees.Length == 0 || _nFeatures <= 0)
+            throw new InvalidOperationException("FastRandomForest must be fit before calling Predict.");
         int rows = features.Rows;
+        if (features.Columns != _nFeatures)
+            throw new ArgumentException($"Expected {_nFeatures} features but got {features.Columns}.", nameof(features));
+        if (predictions.Length < rows)
+            throw new ArgumentException("Predictions span is smaller than feature rows.", nameof(predictions));
+
         if (features.IsColumnar)
         {
             for (int r = 0; r < rows; r++)
@@ -99,9 +128,11 @@ public sealed class FastRandomForest : IPredictor
         }
         else
         {
+            ReadOnlySpan<float> data = features.Span;
+            int cols = _nFeatures;
             for (int r = 0; r < rows; r++)
             {
-                predictions[r] = PredictRow(features.GetRow(r));
+                predictions[r] = PredictRow(data.Slice(r * cols, cols));
             }
         }
     }
@@ -109,7 +140,10 @@ public sealed class FastRandomForest : IPredictor
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float PredictRow(ReadOnlySpan<float> row)
     {
-        if (_trees.Length == 0) return 0f;
+        if (_trees.Length == 0 || _nFeatures <= 0)
+            throw new InvalidOperationException("FastRandomForest must be fit before calling PredictRow.");
+        if (row.Length != _nFeatures)
+            throw new ArgumentException($"Expected {_nFeatures} features but got {row.Length}.", nameof(row));
 
         float sum = 0f;
         for (int t = 0; t < _trees.Length; t++)
@@ -124,7 +158,10 @@ public sealed class FastRandomForest : IPredictor
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float PredictProbability(ReadOnlySpan<float> row)
     {
-        if (_trees.Length == 0) return 0f;
+        if (_trees.Length == 0 || _nFeatures <= 0)
+            throw new InvalidOperationException("FastRandomForest must be fit before calling PredictProbability.");
+        if (row.Length != _nFeatures)
+            throw new ArgumentException($"Expected {_nFeatures} features but got {row.Length}.", nameof(row));
 
         float sum = 0f;
         for (int t = 0; t < _trees.Length; t++)

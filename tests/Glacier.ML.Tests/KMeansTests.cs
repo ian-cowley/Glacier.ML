@@ -1,4 +1,5 @@
 using System;
+using System.Reflection;
 using Glacier.ML.Clustering;
 using Glacier.ML.Core;
 using Xunit;
@@ -379,6 +380,233 @@ public class KMeansTests
             }
 
             Assert.Equal(expected, actual);
+        }
+    }
+
+    [Fact]
+    public void KMeans_EmptyCluster_NeverResetsToOrigin_BothRowMajorAndColumnar()
+    {
+        // All points live far from origin around (100, 100) and (110, 110), with k=5 > 2 distinct points
+        // Empty clusters must be preserved/re-seeded onto data manifold, never reset to (0, 0)
+        float[] col0 = [100f, 100f, 110f, 110f, 100f, 110f];
+        float[] col1 = [100f, 100f, 110f, 110f, 100f, 110f];
+
+        using var colMatrix = new FeatureMatrix(new ReadOnlyMemory<float>[] { col0, col1 });
+        var kmCol = new KMeans(k: 5, maxIterations: 20, target: GpuTarget.Cpu);
+        kmCol.Fit(colMatrix);
+
+        for (int c = 0; c < 5; c++)
+        {
+            float cx = kmCol.Centroids[c * 2];
+            float cy = kmCol.Centroids[c * 2 + 1];
+            Assert.True(cx >= 90f && cy >= 90f, $"Columnar centroid {c} collapsed to ({cx}, {cy}) instead of staying on manifold!");
+        }
+
+        using var rowMatrix = new FeatureMatrix(6, 2);
+        for (int r = 0; r < 6; r++)
+        {
+            rowMatrix.SetValue(r, 0, col0[r]);
+            rowMatrix.SetValue(r, 1, col1[r]);
+        }
+        var kmRow = new KMeans(k: 5, maxIterations: 20, target: GpuTarget.Cpu);
+        kmRow.Fit(rowMatrix);
+
+        for (int c = 0; c < 5; c++)
+        {
+            float cx = kmRow.Centroids[c * 2];
+            float cy = kmRow.Centroids[c * 2 + 1];
+            Assert.True(cx >= 90f && cy >= 90f, $"Row-major centroid {c} collapsed to ({cx}, {cy}) instead of staying on manifold!");
+        }
+    }
+
+    [Fact]
+    public void KMeans_PredictRow_WhenRowsLessThanK_DoesNotReadOutOfBounds()
+    {
+        using var matrix = new FeatureMatrix(2, 3);
+        matrix.SetValue(0, 0, 1f); matrix.SetValue(0, 1, 1f); matrix.SetValue(0, 2, 1f);
+        matrix.SetValue(1, 0, 50f); matrix.SetValue(1, 1, 50f); matrix.SetValue(1, 2, 50f);
+
+        var kmeans = new KMeans(k: 8, maxIterations: 10, target: GpuTarget.Cpu);
+        kmeans.Fit(matrix);
+
+        Assert.Equal(2 * 3, kmeans.Centroids.Length);
+        int c0 = kmeans.PredictRow(new float[] { 1.1f, 1.0f, 0.9f });
+        int c1 = kmeans.PredictRow(new float[] { 49.9f, 50.1f, 50.0f });
+        Assert.InRange(c0, 0, 1);
+        Assert.InRange(c1, 0, 1);
+        Assert.NotEqual(c0, c1);
+    }
+
+    [Fact]
+    public void KMeans_ValidationAndUnsupportedTargets_ThrowExpectedExceptions()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new KMeans(k: 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new KMeans(k: 3, maxIterations: 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new KMeans(k: 3, tolerance: -0.1f));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new KMeans(k: 3, tolerance: float.NaN));
+
+        var unfitted = new KMeans(k: 2);
+        using var matrix = new FeatureMatrix(4, 2);
+        Assert.Throws<InvalidOperationException>(() => unfitted.Predict(matrix, new int[4]));
+        Assert.Throws<InvalidOperationException>(() => unfitted.PredictRow(new float[2]));
+
+        unfitted.Fit(matrix);
+        Assert.Throws<ArgumentException>(() => unfitted.PredictRow(new float[1]));
+        Assert.Throws<ArgumentException>(() => unfitted.PredictRow(new float[3]));
+        Assert.Throws<ArgumentException>(() => unfitted.Predict(new FeatureMatrix(4, 3), new int[4]));
+
+        var amdKmeans = new KMeans(k: 2, target: GpuTarget.Amd);
+        Assert.Throws<NotSupportedException>(() => amdKmeans.Fit(matrix));
+        var dualKmeans = new KMeans(k: 2, target: GpuTarget.DualGpu);
+        Assert.Throws<NotSupportedException>(() => dualKmeans.Fit(matrix));
+    }
+
+    [Theory]
+    [InlineData(100, 10000.0f, 2, 2)]   // Single-threaded (< 512) at 10000 offset
+    [InlineData(600, 10000.0f, 2, 2)]   // Parallel (>= 512) at 10000 offset
+    [InlineData(120, 500.0f, 5, 2)]     // Offset 500 with k=5 > 2 clusters (empty cluster + Predict)
+    public void KMeans_Predict_LargeOffsetClusters_MatchesPredictRowAndColumnar(
+        int rows,
+        float offset,
+        int k,
+        int cols)
+    {
+        var rng = new Random(2026);
+        using var rowMatrix = new FeatureMatrix(rows, cols);
+        float[][] colArrays = new float[cols][];
+        for (int c = 0; c < cols; c++) colArrays[c] = new float[rows];
+
+        for (int r = 0; r < rows; r++)
+        {
+            float baseCoord = (r % 2 == 0) ? offset : offset + 2.0f;
+            for (int c = 0; c < cols; c++)
+            {
+                float v = baseCoord + (float)(rng.NextDouble() * 0.2 - 0.1);
+                rowMatrix.SetValue(r, c, v);
+                colArrays[c][r] = v;
+            }
+        }
+
+        ReadOnlyMemory<float>[] colMems = new ReadOnlyMemory<float>[cols];
+        for (int c = 0; c < cols; c++) colMems[c] = colArrays[c];
+        using var colMatrix = new FeatureMatrix(colMems);
+
+        var kmRow = new KMeans(k: k, maxIterations: 30, target: GpuTarget.Cpu);
+        kmRow.Fit(rowMatrix);
+
+        int[] rowAssignments = new int[rows];
+        int[] colAssignments = new int[rows];
+        kmRow.Predict(rowMatrix, rowAssignments, GpuTarget.Cpu);
+        kmRow.Predict(colMatrix, colAssignments, GpuTarget.Cpu);
+
+        for (int r = 0; r < rows; r++)
+        {
+            int expected = kmRow.PredictRow(rowMatrix.GetRow(r));
+            Assert.Equal(expected, rowAssignments[r]);
+            Assert.Equal(expected, colAssignments[r]);
+        }
+
+        if (k == 2)
+        {
+            // Verify the two separated clusters are cleanly separated with 0/rows misclassification
+            int clusterEven = rowAssignments[0];
+            int clusterOdd = rowAssignments[1];
+            Assert.NotEqual(clusterEven, clusterOdd);
+            for (int r = 0; r < rows; r++)
+            {
+                Assert.Equal(r % 2 == 0 ? clusterEven : clusterOdd, rowAssignments[r]);
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(100, 1_000_000f)]
+    [InlineData(600, 1_000_000f)]
+    [InlineData(2500, 100_000f)]
+    [InlineData(2500, 1_000_000f)]
+    [InlineData(10000, 100_000f)]
+    [InlineData(10000, 1_000_000f)]
+    public void KMeans_Fit_And_FitColumnar_ExtremeOffset_PreservesMStepPrecision(int rows, float offset)
+    {
+        int half = rows / 2;
+        using var rowMatrix = new FeatureMatrix(rows, 2);
+        float[] col0 = new float[rows];
+        float[] col1 = new float[rows];
+
+        for (int r = 0; r < rows; r++)
+        {
+            float v = r < half ? offset : offset + 2.0f;
+            rowMatrix.SetValue(r, 0, v);
+            rowMatrix.SetValue(r, 1, v);
+            col0[r] = v;
+            col1[r] = v;
+        }
+
+        using var colMatrix = new FeatureMatrix(new ReadOnlyMemory<float>[] { col0, col1 });
+        FieldInfo? dataField = typeof(FeatureMatrix).GetField("_data", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(dataField);
+        Assert.Null(dataField!.GetValue(colMatrix));
+
+        var kmRow = new KMeans(k: 2, maxIterations: 20, target: GpuTarget.Cpu);
+        kmRow.Fit(rowMatrix);
+
+        var kmCol = new KMeans(k: 2, maxIterations: 20, target: GpuTarget.Cpu);
+        kmCol.Fit(colMatrix);
+
+        // Columnar Fit must never materialize row-major _data
+        Assert.Null(dataField.GetValue(colMatrix));
+
+        AssertRecoveredExtremeOffsetCentroids(kmRow, offset);
+        AssertRecoveredExtremeOffsetCentroids(kmCol, offset);
+
+        int[] rowAssign = new int[rows];
+        int[] colAssign = new int[rows];
+        kmRow.Predict(rowMatrix, rowAssign, GpuTarget.Cpu);
+        kmCol.Predict(colMatrix, colAssign, GpuTarget.Cpu);
+
+        Assert.Null(dataField.GetValue(colMatrix));
+
+        int rowClusterLow = kmRow.PredictRow([offset, offset]);
+        int rowClusterHigh = kmRow.PredictRow([offset + 2.0f, offset + 2.0f]);
+        Assert.NotEqual(rowClusterLow, rowClusterHigh);
+        Assert.Equal(rowClusterLow, kmRow.PredictRow([offset + 0.5f, offset + 0.5f]));
+        Assert.Equal(rowClusterHigh, kmRow.PredictRow([offset + 1.5f, offset + 1.5f]));
+
+        int colClusterLow = kmCol.PredictRow([offset, offset]);
+        int colClusterHigh = kmCol.PredictRow([offset + 2.0f, offset + 2.0f]);
+        Assert.NotEqual(colClusterLow, colClusterHigh);
+        Assert.Equal(colClusterLow, kmCol.PredictRow([offset + 0.5f, offset + 0.5f]));
+        Assert.Equal(colClusterHigh, kmCol.PredictRow([offset + 1.5f, offset + 1.5f]));
+
+        for (int r = 0; r < rows; r++)
+        {
+            Assert.Equal(r < half ? rowClusterLow : rowClusterHigh, rowAssign[r]);
+            Assert.Equal(r < half ? colClusterLow : colClusterHigh, colAssign[r]);
+        }
+    }
+
+    private static void AssertRecoveredExtremeOffsetCentroids(KMeans km, float offset)
+    {
+        Assert.Equal(4, km.Centroids.Length);
+        float c0x = km.Centroids[0];
+        float c0y = km.Centroids[1];
+        float c1x = km.Centroids[2];
+        float c1y = km.Centroids[3];
+
+        bool orderNormal = MathF.Abs(c0x - offset) < 1e-3f;
+        if (orderNormal)
+        {
+            Assert.True(MathF.Abs(c0x - offset) < 1e-3f, $"c0x={c0x}, expected={offset}");
+            Assert.True(MathF.Abs(c0y - offset) < 1e-3f, $"c0y={c0y}, expected={offset}");
+            Assert.True(MathF.Abs(c1x - (offset + 2.0f)) < 1e-3f, $"c1x={c1x}, expected={offset + 2.0f}");
+            Assert.True(MathF.Abs(c1y - (offset + 2.0f)) < 1e-3f, $"c1y={c1y}, expected={offset + 2.0f}");
+        }
+        else
+        {
+            Assert.True(MathF.Abs(c0x - (offset + 2.0f)) < 1e-3f, $"c0x={c0x}, expected={offset + 2.0f}");
+            Assert.True(MathF.Abs(c0y - (offset + 2.0f)) < 1e-3f, $"c0y={c0y}, expected={offset + 2.0f}");
+            Assert.True(MathF.Abs(c1x - offset) < 1e-3f, $"c1x={c1x}, expected={offset}");
+            Assert.True(MathF.Abs(c1y - offset) < 1e-3f, $"c1y={c1y}, expected={offset}");
         }
     }
 }

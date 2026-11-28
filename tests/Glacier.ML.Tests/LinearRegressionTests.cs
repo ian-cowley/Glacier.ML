@@ -80,4 +80,93 @@ public class LinearRegressionTests
 
         Assert.True(normRidge < normOls, $"Ridge norm ({normRidge}) should be less than OLS norm ({normOls})");
     }
+
+    [Fact]
+    public void FastLinearRegression_ZeroAlpha_ExactOlsOnTinyScaleFeatures_NoHiddenBias()
+    {
+        // Features scaled by 1e-4 so X^T X ~ 1e-6; old hidden 1e-6f regularization distorted weights by ~50%.
+        const int rows = 200;
+        const int cols = 2;
+        using var matrix = new FeatureMatrix(rows, cols);
+        float[] targets = new float[rows];
+
+        var rng = new Random(123);
+        for (int r = 0; r < rows; r++)
+        {
+            float x0 = (float)(rng.NextDouble() * 2e-4 - 1e-4);
+            float x1 = (float)(rng.NextDouble() * 2e-4 - 1e-4);
+            matrix.SetValue(r, 0, x0);
+            matrix.SetValue(r, 1, x1);
+            targets[r] = 3.0f * x0 - 2.0f * x1 + 1.5f;
+        }
+
+        var reg = new FastLinearRegression(alpha: 0.0f, fitIntercept: true, target: GpuTarget.Cpu);
+        reg.Fit(matrix, targets);
+
+        Assert.InRange(reg.Weights[0], 2.99f, 3.01f);
+        Assert.InRange(reg.Weights[1], -2.01f, -1.99f);
+        Assert.InRange(reg.Intercept, 1.499f, 1.501f);
+    }
+
+    [Fact]
+    public void FastLinearRegression_CollinearColumns_SolvesViaJacobiPseudoinverseWithoutExplosion()
+    {
+        const int rows = 100;
+        using var matrix = new FeatureMatrix(rows, 3);
+        float[] targets = new float[rows];
+
+        var rng = new Random(77);
+        for (int r = 0; r < rows; r++)
+        {
+            float x0 = (float)rng.NextDouble() * 10f;
+            matrix.SetValue(r, 0, x0);
+            matrix.SetValue(r, 1, x0);        // Duplicate column
+            matrix.SetValue(r, 2, 2.0f * x0); // Exact linear combination
+            targets[r] = 6.0f * x0 + 2.0f;
+        }
+
+        var reg = new FastLinearRegression(alpha: 0.0f, fitIntercept: true, target: GpuTarget.Cpu);
+        reg.Fit(matrix, targets);
+
+        for (int c = 0; c < 3; c++)
+        {
+            Assert.True(float.IsFinite(reg.Weights[c]));
+            Assert.True(MathF.Abs(reg.Weights[c]) < 10f, $"Collinear weight[{c}] exploded to {reg.Weights[c]}");
+        }
+
+        float[] preds = new float[rows];
+        reg.Predict(matrix, preds);
+        Assert.True(Metrics.R2Score(targets, preds) > 0.9999f);
+    }
+
+    [Fact]
+    public void FastLinearRegression_ValidationAndColumnarZeroCopy_Works()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new FastLinearRegression(alpha: -0.1f));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new FastLinearRegression(alpha: float.NaN));
+
+        var unfitted = new FastLinearRegression();
+        using var m = new FeatureMatrix(4, 2);
+        Assert.Throws<InvalidOperationException>(() => unfitted.Predict(m, new float[4]));
+        Assert.Throws<InvalidOperationException>(() => unfitted.PredictRow(new float[2]));
+
+        float[] c0 = [1f, 2f, 3f, 4f];
+        float[] c1 = [2f, 4f, 6f, 8f];
+        float[] y = [5f, 10f, 15f, 20f];
+        using var colMat = new FeatureMatrix(new ReadOnlyMemory<float>[] { c0, c1 });
+        unfitted.Fit(colMat, y);
+
+        var dataField = typeof(FeatureMatrix).GetField("_data", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.Null(dataField?.GetValue(colMat));
+
+        float[] preds = new float[4];
+        unfitted.Predict(colMat, preds);
+        Assert.Null(dataField?.GetValue(colMat));
+        for (int i = 0; i < 4; i++) Assert.Equal(y[i], preds[i], precision: 3);
+
+        Assert.Throws<ArgumentException>(() => unfitted.PredictRow(new float[1]));
+        Assert.Throws<ArgumentException>(() => unfitted.PredictRow(new float[3]));
+        Assert.Throws<ArgumentException>(() => unfitted.Predict(new FeatureMatrix(4, 3), new float[4]));
+        Assert.Throws<NotSupportedException>(() => new FastLinearRegression(target: GpuTarget.Nvidia).Fit(m, y));
+    }
 }

@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Glacier.ML.Compute;
@@ -8,9 +9,9 @@ namespace Glacier.ML.Clustering;
 
 /// <summary>
 /// Hardware-accelerated k-means clustering engine for .NET 10.
-/// Supports bare-metal GPU acceleration (NVIDIA RTX 4060 dGPU, AMD Radeon 890M APU, Auto, and CPU).
+/// Supports bare-metal NVIDIA CUDA acceleration (<see cref="GpuTarget.Nvidia"/>, <see cref="GpuTarget.Auto"/>) and multi-core SIMD CPU (<see cref="GpuTarget.Cpu"/>).
 /// </summary>
-public sealed class KMeans
+public sealed class KMeans : IUnsupervisedEstimator<KMeans>
 {
     private readonly int _k;
     private readonly int _maxIterations;
@@ -30,15 +31,31 @@ public sealed class KMeans
 
     public KMeans(int k = 8, int maxIterations = 100, float tolerance = 1e-4f, GpuTarget target = GpuTarget.Auto)
     {
-        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Number of clusters k must be positive.");
+        if (maxIterations <= 0) throw new ArgumentOutOfRangeException(nameof(maxIterations), "MaxIterations must be positive.");
+        if (!float.IsFinite(tolerance) || tolerance < 0f)
+            throw new ArgumentOutOfRangeException(nameof(tolerance), "Tolerance must be finite and non-negative.");
+
         _k = k;
         _maxIterations = maxIterations;
         _tolerance = tolerance;
         _target = target;
     }
 
+    KMeans IUnsupervisedEstimator<KMeans>.Fit(FeatureMatrix features)
+    {
+        Fit(features);
+        return this;
+    }
+
     public void Fit(FeatureMatrix features)
     {
+        ArgumentNullException.ThrowIfNull(features);
+        if (_target is GpuTarget.Amd or GpuTarget.DualGpu)
+            throw new NotSupportedException($"GpuTarget.{_target} is not supported by KMeans. Use Auto, Nvidia, or Cpu.");
+        if (features.Rows <= 0)
+            throw new ArgumentException("FeatureMatrix must contain at least one row.", nameof(features));
+
         if (features.IsColumnar)
         {
             FitColumnar(features);
@@ -58,8 +75,8 @@ public sealed class KMeans
         int firstIdx = rng.Next(0, rows);
         features.GetRow(firstIdx).CopyTo(_centroids.AsSpan(0, cols));
 
-        float[] minDistances = new float[rows];
-        Array.Fill(minDistances, float.MaxValue);
+        double[] minDistances = new double[rows];
+        Array.Fill(minDistances, double.MaxValue);
 
         for (int c = 1; c < k; c++)
         {
@@ -69,7 +86,7 @@ public sealed class KMeans
             {
                 Parallel.For(0, rows, r =>
                 {
-                    float d = KMeansKernels.EuclideanDistanceSquared(features.GetRow(r), _centroids.AsSpan(centroidOffset, cols));
+                    double d = KMeansKernels.EuclideanDistanceSquared(features.GetRow(r), _centroids.AsSpan(centroidOffset, cols));
                     if (d < minDistances[r]) minDistances[r] = d;
                 });
             }
@@ -78,7 +95,7 @@ public sealed class KMeans
                 ReadOnlySpan<float> lastCentroid = _centroids.AsSpan(centroidOffset, cols);
                 for (int r = 0; r < rows; r++)
                 {
-                    float d = KMeansKernels.EuclideanDistanceSquared(features.GetRow(r), lastCentroid);
+                    double d = KMeansKernels.EuclideanDistanceSquared(features.GetRow(r), lastCentroid);
                     if (d < minDistances[r]) minDistances[r] = d;
                 }
             }
@@ -109,15 +126,15 @@ public sealed class KMeans
 
         // Iterative optimization loop
         int[] assignments = new int[rows];
-        float[] newCentroids = new float[k * cols];
+        double[] newCentroids = new double[k * cols];
         int[] clusterCounts = new int[k];
 
         int numThreads = Math.Min(Environment.ProcessorCount, Math.Max(1, rows / 512));
-        float[][] threadCentroids = new float[numThreads][];
+        double[][] threadCentroids = new double[numThreads][];
         int[][] threadCounts = new int[numThreads][];
         for (int t = 0; t < numThreads; t++)
         {
-            threadCentroids[t] = new float[k * cols];
+            threadCentroids[t] = new double[k * cols];
             threadCounts[t] = new int[k];
         }
 
@@ -136,7 +153,7 @@ public sealed class KMeans
                 });
             }
 
-            // M-step: Recompute centroids in parallel with thread-local buffers
+            // M-step: Recompute centroids in parallel with thread-local double accumulators
             if (numThreads > 1)
             {
                 Parallel.For(0, numThreads, t =>
@@ -147,7 +164,7 @@ public sealed class KMeans
                     int startRow = t * rows / numThreads;
                     int endRow = (t == numThreads - 1) ? rows : (t + 1) * rows / numThreads;
 
-                    float[] localCentroids = threadCentroids[t];
+                    double[] localCentroids = threadCentroids[t];
                     int[] localCounts = threadCounts[t];
 
                     for (int r = startRow; r < endRow; r++)
@@ -165,7 +182,7 @@ public sealed class KMeans
 
                 for (int t = 0; t < numThreads; t++)
                 {
-                    float[] tCent = threadCentroids[t];
+                    double[] tCent = threadCentroids[t];
                     int[] tCnt = threadCounts[t];
                     for (int c = 0; c < k; c++)
                     {
@@ -192,17 +209,24 @@ public sealed class KMeans
                 }
             }
 
-            float maxShift = 0f;
+            double maxShift = 0.0;
+            bool hasEmptyCluster = false;
             for (int c = 0; c < k; c++)
             {
-                int count = Math.Max(1, clusterCounts[c]);
+                int count = clusterCounts[c];
+                if (count == 0)
+                {
+                    hasEmptyCluster = true;
+                    continue;
+                }
+
                 int offset = c * cols;
-                float shift = 0f;
+                double shift = 0.0;
 
                 for (int d = 0; d < cols; d++)
                 {
-                    float updated = newCentroids[offset + d] / count;
-                    float diff = updated - _centroids[offset + d];
+                    float updated = (float)(newCentroids[offset + d] / count);
+                    double diff = (double)updated - _centroids[offset + d];
                     shift += diff * diff;
                     _centroids[offset + d] = updated;
                 }
@@ -210,11 +234,69 @@ public sealed class KMeans
                 if (shift > maxShift) maxShift = shift;
             }
 
+            if (hasEmptyCluster)
+            {
+                double reseedShift = RelocateEmptyClustersRowMajor(features, assignments, clusterCounts, k, rows, cols);
+                if (reseedShift > maxShift) maxShift = reseedShift;
+            }
+
             if (maxShift < _tolerance)
                 break; // Converged
         }
 
         UpdateCentroidNorms();
+    }
+
+    private double RelocateEmptyClustersRowMajor(
+        FeatureMatrix features,
+        int[] assignments,
+        int[] clusterCounts,
+        int k,
+        int rows,
+        int cols)
+    {
+        double maxShift = 0.0;
+        bool[] claimed = new bool[rows];
+
+        for (int c = 0; c < k; c++)
+        {
+            if (clusterCounts[c] > 0) continue;
+
+            int bestRow = -1;
+            double maxErr = 0.0;
+            for (int r = 0; r < rows; r++)
+            {
+                if (claimed[r]) continue;
+                int assignedCluster = assignments[r];
+                double err = KMeansKernels.EuclideanDistanceSquared(
+                    features.GetRow(r),
+                    _centroids.AsSpan(assignedCluster * cols, cols));
+                if (err > maxErr)
+                {
+                    maxErr = err;
+                    bestRow = r;
+                }
+            }
+
+            if (bestRow >= 0 && maxErr > 0.0)
+            {
+                claimed[bestRow] = true;
+                int offset = c * cols;
+                ReadOnlySpan<float> sample = features.GetRow(bestRow);
+                double shift = 0.0;
+                for (int d = 0; d < cols; d++)
+                {
+                    float updated = sample[d];
+                    double diff = (double)updated - _centroids[offset + d];
+                    shift += diff * diff;
+                    _centroids[offset + d] = updated;
+                }
+                if (shift > maxShift) maxShift = shift;
+            }
+            // Otherwise preserve existing centroid without resetting to origin
+        }
+
+        return maxShift;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -226,22 +308,28 @@ public sealed class KMeans
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Predict(FeatureMatrix features, Span<int> clusterAssignments, GpuTarget target)
     {
+        ArgumentNullException.ThrowIfNull(features);
+        if (target is GpuTarget.Amd or GpuTarget.DualGpu)
+            throw new NotSupportedException($"GpuTarget.{target} is not supported by KMeans. Use Auto, Nvidia, or Cpu.");
+        if (_dimensions <= 0 || _centroids.Length == 0)
+            throw new InvalidOperationException("KMeans must be fit before calling Predict.");
+
         int rows = features.Rows;
         int cols = features.Columns;
-        if (rows == 0 || _centroids.Length == 0)
+        if (rows == 0)
         {
             return;
         }
 
-        if (_dimensions > 0 && cols != _dimensions)
+        if (cols != _dimensions)
         {
             throw new ArgumentException($"Expected {_dimensions} features but got {cols}.", nameof(features));
         }
 
-        int k = _dimensions > 0 ? _centroids.Length / _dimensions : _k;
+        int k = _centroids.Length / _dimensions;
         if (k == 0)
         {
-            return;
+            throw new InvalidOperationException("KMeans has no fitted centroids.");
         }
 
         if (clusterAssignments.Length < rows)
@@ -251,32 +339,38 @@ public sealed class KMeans
 
         if (features.IsColumnar)
         {
+            ReadOnlyMemory<float>[] colMemories = new ReadOnlyMemory<float>[cols];
+            for (int d = 0; d < cols; d++)
+            {
+                colMemories[d] = features.GetColumnMemory(d);
+            }
+
             unsafe
             {
                 fixed (int* pAssign = clusterAssignments)
+                fixed (float* pCent = _centroids)
                 {
                     nint assignAddr = (nint)pAssign;
+                    nint centAddr = (nint)pCent;
                     Parallel.For(0, rows, r =>
                     {
-                        int* pOut = (int*)assignAddr;
-                        float minD = float.MaxValue;
-                        int bestC = 0;
-                        for (int c = 0; c < k; c++)
+                        float[]? rented = cols > 256 ? ArrayPool<float>.Shared.Rent(cols) : null;
+                        try
                         {
-                            int offset = c * cols;
-                            float d = 0f;
-                            for (int dim = 0; dim < cols; dim++)
+                            Span<float> rowBuf = cols <= 256 ? stackalloc float[cols] : rented.AsSpan(0, cols);
+                            for (int d = 0; d < cols; d++)
                             {
-                                float diff = features.GetColumn(dim)[r] - _centroids[offset + dim];
-                                d += diff * diff;
+                                rowBuf[d] = colMemories[d].Span[r];
                             }
-                            if (d < minD)
+                            fixed (float* pRow = rowBuf)
                             {
-                                minD = d;
-                                bestC = c;
+                                ((int*)assignAddr)[r] = KMeansKernels.FindNearestCentroid(pRow, (float*)centAddr, k, cols);
                             }
                         }
-                        pOut[r] = bestC;
+                        finally
+                        {
+                            if (rented != null) ArrayPool<float>.Shared.Return(rented);
+                        }
                     });
                 }
             }
@@ -288,21 +382,15 @@ public sealed class KMeans
             return;
         }
 
-        if (_centroidNormsSq.Length != k)
-        {
-            UpdateCentroidNorms();
-        }
-
         unsafe
         {
             fixed (float* pData = features.Span)
             fixed (float* pCent = _centroids)
-            fixed (float* pNorms = _centroidNormsSq)
             fixed (int* pAssign = clusterAssignments)
             {
                 if (rows < 512 || Environment.ProcessorCount <= 1)
                 {
-                    KMeansKernels.PredictBatchDecomposed(pData, pCent, pNorms, 0, rows, cols, k, pAssign);
+                    KMeansKernels.PredictBatchExact(pData, pCent, 0, rows, cols, k, pAssign);
                     return;
                 }
 
@@ -315,20 +403,18 @@ public sealed class KMeans
 
                 nint dataAddr = (nint)pData;
                 nint centAddr = (nint)pCent;
-                nint normAddr = (nint)pNorms;
                 nint assignAddr = (nint)pAssign;
 
                 Parallel.For(0, numBlocks, b =>
                 {
                     float* localData = (float*)dataAddr;
                     float* localCent = (float*)centAddr;
-                    float* localNorms = (float*)normAddr;
                     int* localAssign = (int*)assignAddr;
 
                     int startRow = b * blockSize;
                     int endRow = Math.Min(startRow + blockSize, rows);
 
-                    KMeansKernels.PredictBatchDecomposed(localData, localCent, localNorms, startRow, endRow, cols, k, localAssign);
+                    KMeansKernels.PredictBatchExact(localData, localCent, startRow, endRow, cols, k, localAssign);
                 });
             }
         }
@@ -341,18 +427,24 @@ public sealed class KMeans
         _dimensions = cols;
         int k = Math.Min(_k, rows);
 
+        ReadOnlyMemory<float>[] colMemories = new ReadOnlyMemory<float>[cols];
+        for (int d = 0; d < cols; d++)
+        {
+            colMemories[d] = features.GetColumnMemory(d);
+        }
+
         _centroids = new float[k * cols];
         var rng = new Random(42);
 
-        // k-means++ initialization directly on columnar data
+        // k-means++ initialization directly on columnar data (zero RawArray copy)
         int firstIdx = rng.Next(0, rows);
         for (int d = 0; d < cols; d++)
         {
-            _centroids[d] = features.GetColumn(d)[firstIdx];
+            _centroids[d] = colMemories[d].Span[firstIdx];
         }
 
-        float[] minDistances = new float[rows];
-        Array.Fill(minDistances, float.MaxValue);
+        double[] minDistances = new double[rows];
+        Array.Fill(minDistances, double.MaxValue);
 
         for (int c = 1; c < k; c++)
         {
@@ -360,10 +452,10 @@ public sealed class KMeans
 
             Parallel.For(0, rows, r =>
             {
-                float d = 0f;
+                double d = 0.0;
                 for (int dim = 0; dim < cols; dim++)
                 {
-                    float diff = features.GetColumn(dim)[r] - _centroids[centroidOffset + dim];
+                    double diff = (double)colMemories[dim].Span[r] - _centroids[centroidOffset + dim];
                     d += diff * diff;
                 }
                 if (d < minDistances[r]) minDistances[r] = d;
@@ -392,21 +484,21 @@ public sealed class KMeans
             int nextOffset = c * cols;
             for (int d = 0; d < cols; d++)
             {
-                _centroids[nextOffset + d] = features.GetColumn(d)[chosenIdx];
+                _centroids[nextOffset + d] = colMemories[d].Span[chosenIdx];
             }
         }
 
         // Iterative optimization loop
         int[] assignments = new int[rows];
-        float[] newCentroids = new float[k * cols];
+        double[] newCentroids = new double[k * cols];
         int[] clusterCounts = new int[k];
 
         int numThreads = Math.Min(Environment.ProcessorCount, Math.Max(1, rows / 512));
-        float[][] threadCentroids = new float[numThreads][];
+        double[][] threadCentroids = new double[numThreads][];
         int[][] threadCounts = new int[numThreads][];
         for (int t = 0; t < numThreads; t++)
         {
-            threadCentroids[t] = new float[k * cols];
+            threadCentroids[t] = new double[k * cols];
             threadCounts[t] = new int[k];
         }
 
@@ -415,30 +507,36 @@ public sealed class KMeans
             Array.Clear(newCentroids);
             Array.Clear(clusterCounts);
 
-            // E-step: Assign points to nearest centroid directly over column spans
-            Parallel.For(0, rows, r =>
+            // E-step: Assign points to nearest centroid directly over hoisted column spans using SIMD
+            unsafe
             {
-                float minD = float.MaxValue;
-                int bestC = 0;
-                for (int c = 0; c < k; c++)
+                fixed (float* pCent = _centroids)
                 {
-                    int offset = c * cols;
-                    float d = 0f;
-                    for (int dim = 0; dim < cols; dim++)
+                    nint centAddr = (nint)pCent;
+                    Parallel.For(0, rows, r =>
                     {
-                        float diff = features.GetColumn(dim)[r] - _centroids[offset + dim];
-                        d += diff * diff;
-                    }
-                    if (d < minD)
-                    {
-                        minD = d;
-                        bestC = c;
-                    }
+                        float[]? rented = cols > 256 ? ArrayPool<float>.Shared.Rent(cols) : null;
+                        try
+                        {
+                            Span<float> rowBuf = cols <= 256 ? stackalloc float[cols] : rented.AsSpan(0, cols);
+                            for (int d = 0; d < cols; d++)
+                            {
+                                rowBuf[d] = colMemories[d].Span[r];
+                            }
+                            fixed (float* pRow = rowBuf)
+                            {
+                                assignments[r] = KMeansKernels.FindNearestCentroid(pRow, (float*)centAddr, k, cols);
+                            }
+                        }
+                        finally
+                        {
+                            if (rented != null) ArrayPool<float>.Shared.Return(rented);
+                        }
+                    });
                 }
-                assignments[r] = bestC;
-            });
+            }
 
-            // M-step: Recompute centroids in parallel with thread-local buffers
+            // M-step: Recompute centroids in parallel with thread-local double buffers (column-outer for cache locality)
             if (numThreads > 1)
             {
                 Parallel.For(0, numThreads, t =>
@@ -449,24 +547,27 @@ public sealed class KMeans
                     int startRow = t * rows / numThreads;
                     int endRow = (t == numThreads - 1) ? rows : (t + 1) * rows / numThreads;
 
-                    float[] localCentroids = threadCentroids[t];
+                    double[] localCentroids = threadCentroids[t];
                     int[] localCounts = threadCounts[t];
 
                     for (int r = startRow; r < endRow; r++)
                     {
-                        int cluster = assignments[r];
-                        localCounts[cluster]++;
-                        int offset = cluster * cols;
-                        for (int d = 0; d < cols; d++)
+                        localCounts[assignments[r]]++;
+                    }
+
+                    for (int d = 0; d < cols; d++)
+                    {
+                        ReadOnlySpan<float> colSpan = colMemories[d].Span;
+                        for (int r = startRow; r < endRow; r++)
                         {
-                            localCentroids[offset + d] += features.GetColumn(d)[r];
+                            localCentroids[assignments[r] * cols + d] += colSpan[r];
                         }
                     }
                 });
 
                 for (int t = 0; t < numThreads; t++)
                 {
-                    float[] tCent = threadCentroids[t];
+                    double[] tCent = threadCentroids[t];
                     int[] tCnt = threadCounts[t];
                     for (int c = 0; c < k; c++)
                     {
@@ -482,27 +583,37 @@ public sealed class KMeans
             {
                 for (int r = 0; r < rows; r++)
                 {
-                    int cluster = assignments[r];
-                    clusterCounts[cluster]++;
-                    int offset = cluster * cols;
-                    for (int d = 0; d < cols; d++)
+                    clusterCounts[assignments[r]]++;
+                }
+
+                for (int d = 0; d < cols; d++)
+                {
+                    ReadOnlySpan<float> colSpan = colMemories[d].Span;
+                    for (int r = 0; r < rows; r++)
                     {
-                        newCentroids[offset + d] += features.GetColumn(d)[r];
+                        newCentroids[assignments[r] * cols + d] += colSpan[r];
                     }
                 }
             }
 
-            float maxShift = 0f;
+            double maxShift = 0.0;
+            bool hasEmptyCluster = false;
             for (int c = 0; c < k; c++)
             {
-                int count = Math.Max(1, clusterCounts[c]);
+                int count = clusterCounts[c];
+                if (count == 0)
+                {
+                    hasEmptyCluster = true;
+                    continue;
+                }
+
                 int offset = c * cols;
-                float shift = 0f;
+                double shift = 0.0;
 
                 for (int d = 0; d < cols; d++)
                 {
-                    float updated = newCentroids[offset + d] / count;
-                    float diff = updated - _centroids[offset + d];
+                    float updated = (float)(newCentroids[offset + d] / count);
+                    double diff = (double)updated - _centroids[offset + d];
                     shift += diff * diff;
                     _centroids[offset + d] = updated;
                 }
@@ -510,11 +621,71 @@ public sealed class KMeans
                 if (shift > maxShift) maxShift = shift;
             }
 
+            if (hasEmptyCluster)
+            {
+                double reseedShift = RelocateEmptyClustersColumnar(colMemories, assignments, clusterCounts, k, rows, cols);
+                if (reseedShift > maxShift) maxShift = reseedShift;
+            }
+
             if (maxShift < _tolerance)
                 break; // Converged
         }
 
         UpdateCentroidNorms();
+    }
+
+    private double RelocateEmptyClustersColumnar(
+        ReadOnlyMemory<float>[] colMemories,
+        int[] assignments,
+        int[] clusterCounts,
+        int k,
+        int rows,
+        int cols)
+    {
+        double maxShift = 0.0;
+        bool[] claimed = new bool[rows];
+
+        for (int c = 0; c < k; c++)
+        {
+            if (clusterCounts[c] > 0) continue;
+
+            int bestRow = -1;
+            double maxErr = 0.0;
+            for (int r = 0; r < rows; r++)
+            {
+                if (claimed[r]) continue;
+                int centOffset = assignments[r] * cols;
+                double err = 0.0;
+                for (int d = 0; d < cols; d++)
+                {
+                    double diff = (double)colMemories[d].Span[r] - _centroids[centOffset + d];
+                    err += diff * diff;
+                }
+                if (err > maxErr)
+                {
+                    maxErr = err;
+                    bestRow = r;
+                }
+            }
+
+            if (bestRow >= 0 && maxErr > 0.0)
+            {
+                claimed[bestRow] = true;
+                int offset = c * cols;
+                double shift = 0.0;
+                for (int d = 0; d < cols; d++)
+                {
+                    float updated = colMemories[d].Span[bestRow];
+                    double diff = (double)updated - _centroids[offset + d];
+                    shift += diff * diff;
+                    _centroids[offset + d] = updated;
+                }
+                if (shift > maxShift) maxShift = shift;
+            }
+            // Otherwise preserve existing centroid without resetting to origin
+        }
+
+        return maxShift;
     }
 
     private void UpdateCentroidNorms()
@@ -529,24 +700,30 @@ public sealed class KMeans
 
         for (int c = 0; c < k; c++)
         {
-            float sum = 0f;
+            double sum = 0.0;
             int offset = c * _dimensions;
             for (int d = 0; d < _dimensions; d++)
             {
-                float v = _centroids[offset + d];
+                double v = _centroids[offset + d];
                 sum += v * v;
             }
-            _centroidNormsSq[c] = sum;
+            _centroidNormsSq[c] = (float)sum;
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public unsafe int PredictRow(ReadOnlySpan<float> row)
     {
+        if (_dimensions <= 0 || _centroids.Length == 0)
+            throw new InvalidOperationException("KMeans must be fit before calling PredictRow.");
+        if (row.Length != _dimensions)
+            throw new ArgumentException($"Expected {_dimensions} features but got {row.Length}.", nameof(row));
+
+        int actualK = _centroids.Length / _dimensions;
         fixed (float* pRow = row)
         fixed (float* pCent = _centroids)
         {
-            return KMeansKernels.FindNearestCentroid(pRow, pCent, _k, _dimensions);
+            return KMeansKernels.FindNearestCentroid(pRow, pCent, actualK, _dimensions);
         }
     }
 }

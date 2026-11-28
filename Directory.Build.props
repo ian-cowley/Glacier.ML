@@ -1,0 +1,12 @@
+<Project>
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))"
+          Condition="Exists($([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../')))" />
+  <PropertyGroup Condition="'$(Company)' == ''">
+    <Company>Glacier Software</Company>
+    <Product>Glacier .NET 10 Ecosystem</Product>
+    <Copyright>Copyright (c) 2026 Glacier Software</Copyright>
+    <Authors>Ian Cowley</Authors>
+    <Deterministic>true</Deterministic>
+    <NoWarn>$(NoWarn);CS1591;CS8981;CA2255;CS0105</NoWarn>
+  </PropertyGroup>
+</Project>

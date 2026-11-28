@@ -6,22 +6,33 @@ using Glacier.ML.Core;
 namespace Glacier.ML.Trees;
 
 /// <summary>
-/// Fast, zero-allocation decision tree classifier stored in a flat contiguous array of nodes.
+/// Fast, zero-allocation binary decision tree classifier (<c>target &gt; 0.5f</c> -&gt; 1.0f, else 0.0f)
+/// stored in a flat contiguous array of nodes.
 /// </summary>
-public sealed class FastDecisionTree : IPredictor
+public sealed class FastDecisionTree : IPredictor, IEstimator<FastDecisionTree>
 {
     private DecisionTreeNode[] _nodes = Array.Empty<DecisionTreeNode>();
     private readonly int _maxDepth;
     private readonly int _minSamplesSplit;
+    private int _nFeatures;
 
     public int MaxDepth => _maxDepth;
     public int MinSamplesSplit => _minSamplesSplit;
+    public int NFeatures => _nFeatures;
     public DecisionTreeNode[] Nodes => _nodes;
 
     public FastDecisionTree(int maxDepth = 6, int minSamplesSplit = 2)
     {
+        if (maxDepth <= 0) throw new ArgumentOutOfRangeException(nameof(maxDepth), "MaxDepth must be positive.");
+        if (minSamplesSplit < 2) throw new ArgumentOutOfRangeException(nameof(minSamplesSplit), "MinSamplesSplit must be at least 2.");
         _maxDepth = maxDepth;
         _minSamplesSplit = minSamplesSplit;
+    }
+
+    FastDecisionTree IEstimator<FastDecisionTree>.Fit(FeatureMatrix features, ReadOnlySpan<float> targets)
+    {
+        Fit(features, targets);
+        return this;
     }
 
     public void Fit(
@@ -30,8 +41,17 @@ public sealed class FastDecisionTree : IPredictor
         int[]? featureIndices = null, 
         int[]? sampleIndices = null)
     {
+        ArgumentNullException.ThrowIfNull(features);
         int numRows = features.Rows;
         int numCols = features.Columns;
+        if (numRows <= 0)
+            throw new ArgumentException("FeatureMatrix must contain at least one row.", nameof(features));
+        if (targets.Length < numRows)
+            throw new ArgumentException("Targets length must match or exceed feature rows.", nameof(targets));
+        if (sampleIndices != null && sampleIndices.Length == 0)
+            throw new ArgumentException("Sample indices cannot be empty.", nameof(sampleIndices));
+
+        _nFeatures = numCols;
 
         int[] activeFeatures = featureIndices ?? new int[numCols];
         if (featureIndices == null)
@@ -258,7 +278,15 @@ public sealed class FastDecisionTree : IPredictor
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Predict(FeatureMatrix features, Span<float> predictions)
     {
+        ArgumentNullException.ThrowIfNull(features);
+        if (_nodes.Length == 0 || _nFeatures <= 0)
+            throw new InvalidOperationException("FastDecisionTree must be fit before calling Predict.");
         int rows = features.Rows;
+        if (features.Columns != _nFeatures)
+            throw new ArgumentException($"Expected {_nFeatures} features but got {features.Columns}.", nameof(features));
+        if (predictions.Length < rows)
+            throw new ArgumentException("Predictions span is smaller than feature rows.", nameof(predictions));
+
         if (features.IsColumnar)
         {
             for (int r = 0; r < rows; r++)
@@ -268,9 +296,11 @@ public sealed class FastDecisionTree : IPredictor
         }
         else
         {
+            ReadOnlySpan<float> data = features.Span;
+            int cols = _nFeatures;
             for (int r = 0; r < rows; r++)
             {
-                predictions[r] = PredictRow(features.GetRow(r));
+                predictions[r] = PredictRow(data.Slice(r * cols, cols));
             }
         }
     }
@@ -278,7 +308,10 @@ public sealed class FastDecisionTree : IPredictor
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float PredictRow(ReadOnlySpan<float> row)
     {
-        if (_nodes.Length == 0) return 0f;
+        if (_nodes.Length == 0 || _nFeatures <= 0)
+            throw new InvalidOperationException("FastDecisionTree must be fit before calling PredictRow.");
+        if (row.Length != _nFeatures)
+            throw new ArgumentException($"Expected {_nFeatures} features but got {row.Length}.", nameof(row));
 
         int curr = 0;
         while (!_nodes[curr].IsLeaf)
@@ -294,7 +327,11 @@ public sealed class FastDecisionTree : IPredictor
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float PredictRowColumnar(FeatureMatrix features, int rowIndex)
     {
-        if (_nodes.Length == 0) return 0f;
+        ArgumentNullException.ThrowIfNull(features);
+        if (_nodes.Length == 0 || _nFeatures <= 0)
+            throw new InvalidOperationException("FastDecisionTree must be fit before calling PredictRowColumnar.");
+        if (features.Columns != _nFeatures)
+            throw new ArgumentException($"Expected {_nFeatures} features but got {features.Columns}.", nameof(features));
 
         int curr = 0;
         while (!_nodes[curr].IsLeaf)

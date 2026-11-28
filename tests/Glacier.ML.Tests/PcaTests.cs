@@ -77,4 +77,99 @@ public class PcaTests
             Assert.False(float.IsInfinity(reconstructed[i]));
         }
     }
+
+    [Fact]
+    public void FastPCA_DegenerateRepeatedEigenvalues_JacobiAchievesTightOrthogonality()
+    {
+        // Construct data with degenerate / closely-spaced variances across 4 axes
+        const int rows = 400;
+        const int cols = 4;
+        using var matrix = new FeatureMatrix(rows, cols);
+        var rng = new Random(17);
+
+        for (int r = 0; r < rows; r++)
+        {
+            // Orthogonal Rademacher-like isotropic components so eigenvalues are nearly equal (~1.0)
+            float u0 = (r % 2 == 0 ? 1f : -1f) + (float)(rng.NextDouble() * 0.01);
+            float u1 = ((r / 2) % 2 == 0 ? 1f : -1f) + (float)(rng.NextDouble() * 0.01);
+            float u2 = ((r / 4) % 2 == 0 ? 1f : -1f) + (float)(rng.NextDouble() * 0.01);
+            float u3 = ((r / 8) % 2 == 0 ? 0.5f : -0.5f) + (float)(rng.NextDouble() * 0.01);
+            matrix.SetValue(r, 0, u0);
+            matrix.SetValue(r, 1, u1);
+            matrix.SetValue(r, 2, u2);
+            matrix.SetValue(r, 3, u3);
+        }
+
+        var pca = new FastPCA(nComponents: cols, target: GpuTarget.Cpu);
+        pca.Fit(matrix);
+
+        for (int i = 0; i < cols; i++)
+        {
+            ReadOnlySpan<float> ci = pca.Components.AsSpan(i * cols, cols);
+            float normSq = 0f;
+            for (int d = 0; d < cols; d++) normSq += ci[d] * ci[d];
+            Assert.True(MathF.Abs(normSq - 1.0f) < 1e-5f, $"NormSq[{i}]={normSq}");
+
+            for (int j = i + 1; j < cols; j++)
+            {
+                ReadOnlySpan<float> cj = pca.Components.AsSpan(j * cols, cols);
+                float dot = 0f;
+                for (int d = 0; d < cols; d++) dot += ci[d] * cj[d];
+                Assert.True(MathF.Abs(dot) < 1e-5f, $"Dot({i},{j})={dot}");
+            }
+
+            if (i > 0)
+            {
+                Assert.True(pca.ExplainedVariance[i - 1] >= pca.ExplainedVariance[i]);
+            }
+        }
+    }
+
+    [Fact]
+    public void FastPCA_NComponentsExceedsColumns_ClampsSafelyAndInverseTransforms()
+    {
+        const int rows = 20;
+        const int cols = 4;
+        using var matrix = new FeatureMatrix(rows, cols);
+        var rng = new Random(101);
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+                matrix.SetValue(r, c, (float)rng.NextDouble() * 10f);
+
+        var pca = new FastPCA(nComponents: 10, target: GpuTarget.Auto);
+        pca.Fit(matrix);
+
+        Assert.Equal(cols, pca.NComponents);
+        Assert.Equal(cols, pca.ExplainedVariance.Length);
+
+        float[] reduced = new float[rows * pca.NComponents];
+        pca.Transform(matrix, reduced);
+
+        float[] reconstructed = new float[rows * cols];
+        pca.InverseTransform(reduced, reconstructed, rows);
+
+        for (int r = 0; r < rows; r++)
+        {
+            for (int c = 0; c < cols; c++)
+            {
+                Assert.Equal(matrix.GetValue(r, c), reconstructed[r * cols + c], precision: 3);
+            }
+        }
+    }
+
+    [Fact]
+    public void FastPCA_ValidationAndUnsupportedTargets_ThrowExpectedExceptions()
+    {
+        var unfitted = new FastPCA(nComponents: 2);
+        using var matrix = new FeatureMatrix(5, 3);
+        Assert.Throws<InvalidOperationException>(() => unfitted.Transform(matrix, new float[10]));
+        Assert.Throws<InvalidOperationException>(() => unfitted.InverseTransform(new float[10], new float[15], 5));
+
+        unfitted.Fit(matrix);
+        Assert.Throws<ArgumentOutOfRangeException>(() => unfitted.InverseTransform(new float[10], new float[15], -1));
+
+        Assert.Throws<NotSupportedException>(() => new FastPCA(2, GpuTarget.Nvidia).Fit(matrix));
+        Assert.Throws<NotSupportedException>(() => new FastPCA(2, GpuTarget.Amd).Fit(matrix));
+        Assert.Throws<NotSupportedException>(() => new FastPCA(2, GpuTarget.DualGpu).Fit(matrix));
+    }
 }

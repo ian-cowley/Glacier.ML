@@ -134,4 +134,90 @@ public class PreprocessorTests
         using var readOnlyOhe = new FeatureMatrix(new ReadOnlyMemory<float>[] { ohe0, ohe1 });
         Assert.Throws<InvalidOperationException>(() => encoder.Transform(cats, readOnlyOhe, startCol: 0));
     }
+
+    [Fact]
+    public void OneHotEncoder_StringCategoriesAndUnfittedValidation_Works()
+    {
+        var encoder = new OneHotEncoder();
+        using var outMat = new FeatureMatrix(4, 3);
+        Assert.Throws<InvalidOperationException>(() => encoder.Transform(new int[] { 1, 2, 3, 4 }, outMat, 0));
+
+        string?[] cats = ["red", "blue", null, "red"];
+        encoder.Fit(cats);
+        Assert.Equal(3, encoder.NumCategories);
+
+        encoder.Transform(cats, outMat, 0);
+        Assert.Equal(1.0f, outMat.GetValue(0, 0));
+        Assert.Equal(1.0f, outMat.GetValue(1, 1));
+        Assert.Equal(1.0f, outMat.GetValue(2, 2));
+        Assert.Equal(1.0f, outMat.GetValue(3, 0));
+
+        Assert.Throws<InvalidOperationException>(() => encoder.Transform(new int[] { 0, 1, 2, 3 }, outMat, 0));
+    }
+
+    [Theory]
+    [InlineData(5)]  // Exercises Vector128 + tail
+    [InlineData(19)] // Exercises Vector512/Vector256 + tail
+    public void Scalers_SimdWideColumnsAndTail_ColumnarParityWithRowMajor(int cols)
+    {
+        const int rows = 64;
+        var rng = new Random(55 + cols);
+
+        float[][] colArraysStd = new float[cols][];
+        float[][] colArraysMm = new float[cols][];
+        using var rowStd = new FeatureMatrix(rows, cols);
+        using var rowMm = new FeatureMatrix(rows, cols);
+
+        for (int c = 0; c < cols; c++)
+        {
+            colArraysStd[c] = new float[rows];
+            colArraysMm[c] = new float[rows];
+        }
+
+        for (int r = 0; r < rows; r++)
+        {
+            for (int c = 0; c < cols; c++)
+            {
+                float v = (float)(rng.NextDouble() * 40.0 - 10.0) * (c + 1);
+                colArraysStd[c][r] = v;
+                colArraysMm[c][r] = v;
+                rowStd.SetValue(r, c, v);
+                rowMm.SetValue(r, c, v);
+            }
+        }
+
+        Memory<float>[] memStd = new Memory<float>[cols];
+        Memory<float>[] memMm = new Memory<float>[cols];
+        for (int c = 0; c < cols; c++)
+        {
+            memStd[c] = colArraysStd[c];
+            memMm[c] = colArraysMm[c];
+        }
+
+        using var colStdMat = new FeatureMatrix(memStd);
+        using var colMmMat = new FeatureMatrix(memMm);
+
+        var stdA = new StandardScaler();
+        var stdB = new StandardScaler();
+        stdA.Fit(rowStd);
+        stdA.Transform(rowStd);
+        stdB.Fit(colStdMat);
+        stdB.Transform(colStdMat);
+
+        var mmA = new MinMaxScaler();
+        var mmB = new MinMaxScaler();
+        mmA.Fit(rowMm);
+        mmA.Transform(rowMm);
+        mmB.Fit(colMmMat);
+        mmB.Transform(colMmMat);
+
+        for (int r = 0; r < rows; r++)
+        {
+            for (int c = 0; c < cols; c++)
+            {
+                Assert.Equal(rowStd.GetValue(r, c), colStdMat.GetValue(r, c), precision: 4);
+                Assert.Equal(rowMm.GetValue(r, c), colMmMat.GetValue(r, c), precision: 4);
+            }
+        }
+    }
 }

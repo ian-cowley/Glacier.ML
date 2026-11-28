@@ -14,7 +14,8 @@ namespace Glacier.ML.Trees;
 public static unsafe class HistogramKernels
 {
     /// <summary>
-    /// Discretizes continuous float values into 256 discrete byte bins based on pre-calculated bin thresholds.
+    /// Discretizes continuous float values into up to 256 discrete byte bins based on sorted bin thresholds via binary search.
+    /// Values &lt;= thresholds[0] map to bin 0; values &gt; thresholds[last] or <see cref="float.NaN"/> map to binThresholds.Length (rightmost bin).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void DiscretizeFeature(
@@ -29,20 +30,48 @@ public static unsafe class HistogramKernels
         if (numThresholds > 255)
             throw new ArgumentOutOfRangeException(nameof(binThresholds), "At most 255 thresholds (256 byte bins) are supported.");
 
+        if (numThresholds == 0)
+        {
+            outputBins.Slice(0, length).Clear();
+            return;
+        }
+
+        int lastIdx = numThresholds - 1;
         fixed (float* pVal = values)
         fixed (float* pThresh = binThresholds)
         fixed (byte* pOut = outputBins)
         {
+            float firstThresh = pThresh[0];
+            float lastThresh = pThresh[lastIdx];
+
             for (int i = 0; i < length; i++)
             {
                 float v = pVal[i];
-                // Linear / binary search for bin index
-                int bin = 0;
-                while (bin < numThresholds && v > pThresh[bin])
+                if (float.IsNaN(v) || v > lastThresh)
                 {
-                    bin++;
+                    // Route NaN consistently to rightmost bin (matching `val <= threshold` -> false -> RIGHT in FastDecisionTree)
+                    pOut[i] = (byte)numThresholds;
+                    continue;
                 }
-                pOut[i] = (byte)bin;
+
+                if (v <= firstThresh)
+                {
+                    pOut[i] = 0;
+                    continue;
+                }
+
+                int lo = 1;
+                int hi = lastIdx;
+                while (lo < hi)
+                {
+                    int mid = lo + ((hi - lo) >> 1);
+                    if (v > pThresh[mid])
+                        lo = mid + 1;
+                    else
+                        hi = mid;
+                }
+
+                pOut[i] = (byte)lo;
             }
         }
     }
@@ -195,7 +224,26 @@ public static unsafe class HistogramKernels
             }
 
             // Reduction across the 4 sub-histograms
-            if (Avx2.IsSupported)
+            if (Avx512F.IsSupported)
+            {
+                for (int b = 0; b < 256; b += 16)
+                {
+                    var g0 = Vector512.Load(pSubG + (0 * 256) + b);
+                    var g1 = Vector512.Load(pSubG + (1 * 256) + b);
+                    var g2 = Vector512.Load(pSubG + (2 * 256) + b);
+                    var g3 = Vector512.Load(pSubG + (3 * 256) + b);
+                    var sumG = Vector512.Add(Vector512.Add(g0, g1), Vector512.Add(g2, g3));
+                    Vector512.Store(sumG, pHistG + b);
+
+                    var c0 = Vector512.Load(pSubC + (0 * 256) + b);
+                    var c1 = Vector512.Load(pSubC + (1 * 256) + b);
+                    var c2 = Vector512.Load(pSubC + (2 * 256) + b);
+                    var c3 = Vector512.Load(pSubC + (3 * 256) + b);
+                    var sumC = Vector512.Add(Vector512.Add(c0, c1), Vector512.Add(c2, c3));
+                    Vector512.Store(sumC, pHistC + b);
+                }
+            }
+            else if (Avx2.IsSupported)
             {
                 for (int b = 0; b < 256; b += 8)
                 {
@@ -212,6 +260,25 @@ public static unsafe class HistogramKernels
                     var c3 = Vector256.Load(pSubC + (3 * 256) + b);
                     var sumC = Vector256.Add(Vector256.Add(c0, c1), Vector256.Add(c2, c3));
                     Vector256.Store(sumC, pHistC + b);
+                }
+            }
+            else if (AdvSimd.IsSupported)
+            {
+                for (int b = 0; b < 256; b += 4)
+                {
+                    var g0 = Vector128.Load(pSubG + (0 * 256) + b);
+                    var g1 = Vector128.Load(pSubG + (1 * 256) + b);
+                    var g2 = Vector128.Load(pSubG + (2 * 256) + b);
+                    var g3 = Vector128.Load(pSubG + (3 * 256) + b);
+                    var sumG = Vector128.Add(Vector128.Add(g0, g1), Vector128.Add(g2, g3));
+                    Vector128.Store(sumG, pHistG + b);
+
+                    var c0 = Vector128.Load(pSubC + (0 * 256) + b);
+                    var c1 = Vector128.Load(pSubC + (1 * 256) + b);
+                    var c2 = Vector128.Load(pSubC + (2 * 256) + b);
+                    var c3 = Vector128.Load(pSubC + (3 * 256) + b);
+                    var sumC = Vector128.Add(Vector128.Add(c0, c1), Vector128.Add(c2, c3));
+                    Vector128.Store(sumC, pHistC + b);
                 }
             }
             else

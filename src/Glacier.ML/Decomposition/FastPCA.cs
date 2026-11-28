@@ -1,27 +1,29 @@
 using System;
+using System.Buffers;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
-using Glacier.ML.Compute;
 using Glacier.ML.Core;
 
 namespace Glacier.ML.Decomposition;
 
 /// <summary>
-/// Hardware-accelerated Principal Component Analysis (PCA) for .NET 10.
-/// Solves covariance matrix and feature projection on GPU (NVIDIA RTX 4060 dGPU, AMD Radeon 890M APU, Auto, and CPU).
+/// Principal Component Analysis (PCA) for .NET 10 using double-precision covariance accumulation
+/// and a Symmetric Cyclic Jacobi eigensolver on multi-core SIMD CPU (<see cref="GpuTarget.Auto"/> and <see cref="GpuTarget.Cpu"/>).
 /// Equivalent to Scikit-Learn sklearn.decomposition.PCA.
 /// </summary>
-public sealed class FastPCA
+public sealed class FastPCA : IUnsupervisedEstimator<FastPCA>
 {
     private readonly int _nComponents;
     private readonly GpuTarget _target;
-    private float[] _components = Array.Empty<float>(); // [nComponents, nFeatures]
+    private int _fittedComponents;
+    private float[] _components = Array.Empty<float>(); // [k, nFeatures]
     private float[] _mean = Array.Empty<float>();       // [nFeatures]
     private float[] _explainedVariance = Array.Empty<float>();
     private float[] _explainedVarianceRatio = Array.Empty<float>();
     private int _nFeatures;
 
-    public int NComponents => _nComponents;
+    public int NComponents => _fittedComponents > 0 ? _fittedComponents : _nComponents;
     public GpuTarget Target => _target;
     public float[] Components => _components;
     public float[] Mean => _mean;
@@ -36,212 +38,281 @@ public sealed class FastPCA
         _target = target;
     }
 
+    FastPCA IUnsupervisedEstimator<FastPCA>.Fit(FeatureMatrix features)
+    {
+        Fit(features);
+        return this;
+    }
+
+    private void ValidateTarget()
+    {
+        if (_target is GpuTarget.Nvidia or GpuTarget.Amd or GpuTarget.DualGpu)
+            throw new NotSupportedException($"GpuTarget.{_target} is not supported by FastPCA (uses CPU SIMD + double-precision Jacobi). Use Auto or Cpu.");
+    }
+
     /// <summary>
     /// Fits the PCA model on the feature matrix X.
-    /// Computes the column means, builds the covariance matrix on GPU via Gram matrix GEMM,
-    /// and solves for the principal components.
+    /// Computes column means and the double-precision covariance matrix without LOH centering copies,
+    /// then extracts sorted orthonormal principal components via Symmetric Cyclic Jacobi eigendecomposition.
     /// </summary>
     public void Fit(FeatureMatrix features)
     {
+        ArgumentNullException.ThrowIfNull(features);
+        ValidateTarget();
+
         int rows = features.Rows;
         int cols = features.Columns;
+        if (rows <= 0)
+            throw new ArgumentException("FeatureMatrix must contain at least one row.", nameof(features));
+
         _nFeatures = cols;
         int k = Math.Min(_nComponents, cols);
+        _fittedComponents = k;
 
-        float[] cov = new float[cols * cols];
-        double totalVariance = 0;
+        double[] meanD = new double[cols];
+        _mean = new float[cols];
+        double[] cov = new double[cols * cols];
+        double factor = 1.0 / Math.Max(1, rows - 1);
 
         if (features.IsColumnar)
         {
-            // 1. Calculate column means directly from column spans
-            _mean = new float[cols];
+            ReadOnlyMemory<float>[] colMemories = new ReadOnlyMemory<float>[cols];
             for (int c = 0; c < cols; c++)
             {
-                var colSpan = features.GetColumn(c);
-                double sum = 0;
-                for (int r = 0; r < rows; r++)
-                {
-                    sum += colSpan[r];
-                }
-                _mean[c] = (float)(sum / rows);
+                colMemories[c] = features.GetColumnMemory(c);
+                double sum = SumDoubleSimd(colMemories[c].Span);
+                meanD[c] = sum / rows;
+                _mean[c] = (float)meanD[c];
             }
-
-            // 2. Compute Covariance Matrix directly over Polaris column spans with zero transposition!
-            // Cov = (1 / (rows - 1)) * X_centered^T * X_centered
-            float factor = 1.0f / Math.Max(1, rows - 1);
 
             Parallel.For(0, cols, i =>
             {
-                ReadOnlySpan<float> colI = features.GetColumn(i);
-                float meanI = _mean[i];
+                ReadOnlySpan<float> colI = colMemories[i].Span;
+                double meanI = meanD[i];
 
                 for (int j = i; j < cols; j++)
                 {
-                    ReadOnlySpan<float> colJ = features.GetColumn(j);
-                    float meanJ = _mean[j];
-
-                    float dot = CenteredDotProductSimd(colI, meanI, colJ, meanJ);
-                    float covVal = dot * factor;
-
+                    ReadOnlySpan<float> colJ = colMemories[j].Span;
+                    double dot = CenteredDotProductDouble(colI, meanI, colJ, meanD[j]);
+                    double covVal = dot * factor;
                     cov[i * cols + j] = covVal;
                     cov[j * cols + i] = covVal;
                 }
             });
-
-            for (int i = 0; i < cols; i++)
-            {
-                totalVariance += cov[i * cols + i];
-            }
         }
         else
         {
-            // 1. Calculate column means
-            _mean = new float[cols];
-            for (int c = 0; c < cols; c++)
+            ReadOnlySpan<float> data = features.Span;
+            for (int r = 0; r < rows; r++)
             {
-                double sum = 0;
-                for (int r = 0; r < rows; r++)
-                {
-                    sum += features.GetValue(r, c);
-                }
-                _mean[c] = (float)(sum / rows);
-            }
-
-            // 2. Create centered feature matrix
-            using var centered = new FeatureMatrix(rows, cols);
-            float[] cRaw = centered.RawArray;
-            float[] fRaw = features.RawArray;
-
-            Parallel.For(0, rows, r =>
-            {
-                int rOffset = r * cols;
+                ReadOnlySpan<float> row = data.Slice((int)((long)r * cols), cols);
                 for (int c = 0; c < cols; c++)
                 {
-                    cRaw[rOffset + c] = fRaw[rOffset + c] - _mean[c];
+                    meanD[c] += row[c];
                 }
-            });
-
-            // 3. Compute Covariance Matrix: Cov = (1 / (rows - 1)) * X_centered^T * X_centered
-            GpuMlAccelerator.ComputeGramMatrix(centered, cov, _target);
-
-            float factor = 1.0f / Math.Max(1, rows - 1);
-            for (int i = 0; i < cols; i++)
-            {
-                totalVariance += cov[i * cols + i] * factor;
             }
 
-            for (int i = 0; i < cov.Length; i++)
+            for (int c = 0; c < cols; c++)
             {
-                cov[i] *= factor;
+                meanD[c] /= rows;
+                _mean[c] = (float)meanD[c];
+            }
+
+            int numThreads = Math.Min(Environment.ProcessorCount, Math.Max(1, rows / 256));
+            if (numThreads > 1)
+            {
+                double[][] threadCovs = new double[numThreads][];
+                for (int t = 0; t < numThreads; t++) threadCovs[t] = new double[cols * cols];
+
+                unsafe
+                {
+                    fixed (float* pData = data)
+                    {
+                        nint dataAddr = (nint)pData;
+                        Parallel.For(0, numThreads, t =>
+                        {
+                            float* pRaw = (float*)dataAddr;
+                            double[] localCov = threadCovs[t];
+                            int startRow = (int)((long)t * rows / numThreads);
+                            int endRow = (t == numThreads - 1) ? rows : (int)((long)(t + 1) * rows / numThreads);
+
+                            double[]? rented = cols > 256 ? ArrayPool<double>.Shared.Rent(cols) : null;
+                            try
+                            {
+                                Span<double> centeredRow = cols <= 256 ? stackalloc double[cols] : rented.AsSpan(0, cols);
+                                for (int r = startRow; r < endRow; r++)
+                                {
+                                    float* pRow = pRaw + ((long)r * cols);
+                                    for (int c = 0; c < cols; c++)
+                                    {
+                                        centeredRow[c] = pRow[c] - meanD[c];
+                                    }
+
+                                    for (int i = 0; i < cols; i++)
+                                    {
+                                        double ci = centeredRow[i];
+                                        int iOffset = i * cols;
+                                        for (int j = i; j < cols; j++)
+                                        {
+                                            localCov[iOffset + j] += ci * centeredRow[j];
+                                        }
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                if (rented != null) ArrayPool<double>.Shared.Return(rented);
+                            }
+                        });
+                    }
+                }
+
+                for (int t = 0; t < numThreads; t++)
+                {
+                    double[] localCov = threadCovs[t];
+                    for (int i = 0; i < cols; i++)
+                    {
+                        int iOffset = i * cols;
+                        for (int j = i; j < cols; j++)
+                        {
+                            cov[iOffset + j] += localCov[iOffset + j];
+                        }
+                    }
+                }
+            }
+            else
+            {
+                double[]? rented = cols > 256 ? ArrayPool<double>.Shared.Rent(cols) : null;
+                try
+                {
+                    Span<double> centeredRow = cols <= 256 ? stackalloc double[cols] : rented.AsSpan(0, cols);
+                    for (int r = 0; r < rows; r++)
+                    {
+                        ReadOnlySpan<float> row = data.Slice((int)((long)r * cols), cols);
+                        for (int c = 0; c < cols; c++)
+                        {
+                            centeredRow[c] = row[c] - meanD[c];
+                        }
+
+                        for (int i = 0; i < cols; i++)
+                        {
+                            double ci = centeredRow[i];
+                            int iOffset = i * cols;
+                            for (int j = i; j < cols; j++)
+                            {
+                                cov[iOffset + j] += ci * centeredRow[j];
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    if (rented != null) ArrayPool<double>.Shared.Return(rented);
+                }
+            }
+
+            for (int i = 0; i < cols; i++)
+            {
+                int iOffset = i * cols;
+                for (int j = i; j < cols; j++)
+                {
+                    double val = cov[iOffset + j] * factor;
+                    cov[iOffset + j] = val;
+                    cov[j * cols + i] = val;
+                }
             }
         }
 
-        // 4. Extract top k eigenvectors & eigenvalues using Power Iteration with Gram-Schmidt orthogonalization
+        SymmetricEigenSolver.SolveDescending(cov, cols, out double[] eigVals, out double[] eigVecs);
+
+        double totalVariance = 0.0;
+        for (int i = 0; i < cols; i++)
+        {
+            if (eigVals[i] > 0.0)
+                totalVariance += eigVals[i];
+        }
+
         _components = new float[k * cols];
         _explainedVariance = new float[k];
         _explainedVarianceRatio = new float[k];
 
-        var rng = new Random(42);
-
         for (int c = 0; c < k; c++)
         {
-            float[] v = new float[cols];
-            for (int i = 0; i < cols; i++) v[i] = (float)rng.NextDouble() - 0.5f;
+            double ev = Math.Max(0.0, eigVals[c]);
+            _explainedVariance[c] = (float)ev;
+            _explainedVarianceRatio[c] = totalVariance > 0.0 ? (float)(ev / totalVariance) : 0f;
 
-            // Normalize initial random vector
-            Normalize(v);
-
-            float eigenvalue = 0f;
-            float[] w = new float[cols];
-
-            // Power iteration
-            for (int iter = 0; iter < 100; iter++)
+            int offset = c * cols;
+            for (int d = 0; d < cols; d++)
             {
-                // w = Cov * v
-                for (int i = 0; i < cols; i++)
-                {
-                    float sum = 0f;
-                    int iOffset = i * cols;
-                    for (int j = 0; j < cols; j++)
-                    {
-                        sum += cov[iOffset + j] * v[j];
-                    }
-                    w[i] = sum;
-                }
-
-                // Deflation: Orthogonalize w against all previously found eigenvectors
-                for (int prev = 0; prev < c; prev++)
-                {
-                    ReadOnlySpan<float> prevVec = _components.AsSpan(prev * cols, cols);
-                    float dot = Dot(w, prevVec);
-                    for (int j = 0; j < cols; j++)
-                    {
-                        w[j] -= dot * prevVec[j];
-                    }
-                }
-
-                // Compute norm
-                eigenvalue = Norm(w);
-                if (eigenvalue < 1e-8f) break;
-
-                // Normalize
-                float invNorm = 1.0f / eigenvalue;
-                float diff = 0f;
-                for (int j = 0; j < cols; j++)
-                {
-                    float nextV = w[j] * invNorm;
-                    float delta = nextV - v[j];
-                    diff += delta * delta;
-                    v[j] = nextV;
-                }
-
-                if (diff < 1e-10f) break; // Converged
+                _components[offset + d] = (float)eigVecs[offset + d];
             }
-
-            v.CopyTo(_components.AsSpan(c * cols, cols));
-            _explainedVariance[c] = eigenvalue;
-            _explainedVarianceRatio[c] = totalVariance > 0 ? (float)(eigenvalue / totalVariance) : 0f;
         }
     }
 
     /// <summary>
     /// Projects feature matrix X onto the principal components: Y = (X - mean) * W^T.
-    /// GPU accelerated via GpuAccelerator matrix multiplication.
+    /// Executes directly via zero-copy SIMD dot products without intermediate matrix allocation.
     /// </summary>
     public void Transform(FeatureMatrix features, Span<float> destination)
     {
+        ArgumentNullException.ThrowIfNull(features);
+        ValidateTarget();
+        if (_nFeatures <= 0 || _components.Length == 0 || _explainedVariance.Length == 0)
+            throw new InvalidOperationException("FastPCA must be fit before calling Transform.");
+
         int rows = features.Rows;
         int cols = features.Columns;
-        int k = _nComponents;
+        int k = _explainedVariance.Length;
 
         if (cols != _nFeatures)
             throw new ArgumentException($"Expected {_nFeatures} features but got {cols}.", nameof(features));
-        if (destination.Length < rows * k)
-            throw new ArgumentException($"Destination span too small. Required {rows * k}, got {destination.Length}.", nameof(destination));
+        if ((long)rows * k > destination.Length)
+            throw new ArgumentException($"Destination span too small. Required {(long)rows * k}, got {destination.Length}.", nameof(destination));
+
+        if (rows == 0) return;
 
         if (features.IsColumnar)
         {
-            // Zero-copy direct projection from columnar memory:
-            // Y[r, c] = sum_{d=0}^{cols-1} (col[d][r] - mean[d]) * components[c, d]
+            ReadOnlyMemory<float>[] colMemories = new ReadOnlyMemory<float>[cols];
+            for (int d = 0; d < cols; d++)
+            {
+                colMemories[d] = features.GetColumnMemory(d);
+            }
+
             unsafe
             {
                 fixed (float* pDest = destination)
+                fixed (float* pComp = _components)
+                fixed (float* pMean = _mean)
                 {
                     nint destAddr = (nint)pDest;
+                    nint compAddr = (nint)pComp;
+                    nint meanAddr = (nint)pMean;
+
                     Parallel.For(0, rows, r =>
                     {
-                        float* pOut = (float*)destAddr;
-                        int destOffset = r * k;
-                        for (int c = 0; c < k; c++)
+                        float* pOut = (float*)destAddr + ((long)r * k);
+                        float* pC = (float*)compAddr;
+                        float* pM = (float*)meanAddr;
+
+                        float[]? rented = cols > 256 ? ArrayPool<float>.Shared.Rent(cols) : null;
+                        try
                         {
-                            int compOffset = c * cols;
-                            float sum = 0f;
+                            Span<float> centered = cols <= 256 ? stackalloc float[cols] : rented.AsSpan(0, cols);
                             for (int d = 0; d < cols; d++)
                             {
-                                float centeredVal = features.GetColumn(d)[r] - _mean[d];
-                                sum += centeredVal * _components[compOffset + d];
+                                centered[d] = colMemories[d].Span[r] - pM[d];
                             }
-                            pOut[destOffset + c] = sum;
+
+                            for (int c = 0; c < k; c++)
+                            {
+                                pOut[c] = DotProductSimd(centered, new ReadOnlySpan<float>(pC + (long)c * cols, cols));
+                            }
+                        }
+                        finally
+                        {
+                            if (rented != null) ArrayPool<float>.Shared.Return(rented);
                         }
                     });
                 }
@@ -249,31 +320,33 @@ public sealed class FastPCA
             return;
         }
 
-        // Center features
-        using var centered = new FeatureMatrix(rows, cols);
-        float[] cRaw = centered.RawArray;
-        float[] fRaw = features.RawArray;
-
-        Parallel.For(0, rows, r =>
+        unsafe
         {
-            int rOffset = r * cols;
-            for (int c = 0; c < cols; c++)
+            fixed (float* pData = features.Span)
+            fixed (float* pDest = destination)
+            fixed (float* pComp = _components)
+            fixed (float* pMean = _mean)
             {
-                cRaw[rOffset + c] = fRaw[rOffset + c] - _mean[c];
-            }
-        });
+                nint dataAddr = (nint)pData;
+                nint destAddr = (nint)pDest;
+                nint compAddr = (nint)pComp;
+                nint meanAddr = (nint)pMean;
 
-        // Components is [k, cols]. For Y = X_c * W^T, we transpose W so W^T is [cols, k]
-        float[] wT = GC.AllocateArray<float>(cols * k, pinned: true);
-        for (int c = 0; c < k; c++)
-        {
-            for (int d = 0; d < cols; d++)
-            {
-                wT[d * k + c] = _components[c * cols + d];
+                Parallel.For(0, rows, r =>
+                {
+                    var row = new ReadOnlySpan<float>((float*)dataAddr + ((long)r * cols), cols);
+                    var mean = new ReadOnlySpan<float>((float*)meanAddr, cols);
+                    float* pOut = (float*)destAddr + ((long)r * k);
+                    float* pC = (float*)compAddr;
+
+                    for (int c = 0; c < k; c++)
+                    {
+                        var comp = new ReadOnlySpan<float>(pC + ((long)c * cols), cols);
+                        pOut[c] = CenteredRowDotProductSimd(row, mean, comp);
+                    }
+                });
             }
         }
-
-        GpuMlAccelerator.ProjectFeatures(centered, wT, destination, k, _target);
     }
 
     /// <summary>
@@ -281,12 +354,18 @@ public sealed class FastPCA
     /// </summary>
     public void InverseTransform(ReadOnlySpan<float> reduced, Span<float> destination, int rows)
     {
-        int cols = _nFeatures;
-        int k = _nComponents;
+        if (_nFeatures <= 0 || _components.Length == 0 || _explainedVariance.Length == 0)
+            throw new InvalidOperationException("FastPCA must be fit before calling InverseTransform.");
+        if (rows < 0)
+            throw new ArgumentOutOfRangeException(nameof(rows), "Rows must be non-negative.");
+        if (rows == 0) return;
 
-        if (reduced.Length < rows * k)
+        int cols = _nFeatures;
+        int k = _explainedVariance.Length;
+
+        if ((long)rows * k > reduced.Length)
             throw new ArgumentException("Reduced span too small.", nameof(reduced));
-        if (destination.Length < rows * cols)
+        if ((long)rows * cols > destination.Length)
             throw new ArgumentException("Destination span too small.", nameof(destination));
 
         unsafe
@@ -298,15 +377,15 @@ public sealed class FastPCA
             {
                 for (int r = 0; r < rows; r++)
                 {
-                    int rOffset = r * cols;
-                    int redOffset = r * k;
+                    long rOffset = (long)r * cols;
+                    long redOffset = (long)r * k;
 
                     for (int d = 0; d < cols; d++)
                     {
                         float sum = pMean[d];
                         for (int c = 0; c < k; c++)
                         {
-                            sum += pRed[redOffset + c] * pComp[c * cols + d];
+                            sum += pRed[redOffset + c] * pComp[(long)c * cols + d];
                         }
                         pDest[rOffset + d] = sum;
                     }
@@ -316,25 +395,52 @@ public sealed class FastPCA
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static float CenteredDotProductSimd(
-        ReadOnlySpan<float> colA, float meanA, 
-        ReadOnlySpan<float> colB, float meanB)
+    private static double SumDoubleSimd(ReadOnlySpan<float> col)
     {
-        int n = colA.Length;
-        int vecSize = System.Numerics.Vector<float>.Count;
-        var vMeanA = new System.Numerics.Vector<float>(meanA);
-        var vMeanB = new System.Numerics.Vector<float>(meanB);
-        var vAcc = System.Numerics.Vector<float>.Zero;
+        int n = col.Length;
+        int vecSize = Vector<float>.Count;
+        var vAccLo = Vector<double>.Zero;
+        var vAccHi = Vector<double>.Zero;
 
         int i = 0;
         for (; i <= n - vecSize; i += vecSize)
         {
-            var va = new System.Numerics.Vector<float>(colA.Slice(i, vecSize)) - vMeanA;
-            var vb = new System.Numerics.Vector<float>(colB.Slice(i, vecSize)) - vMeanB;
-            vAcc += va * vb;
+            var vf = new Vector<float>(col.Slice(i, vecSize));
+            Vector.Widen(vf, out var lo, out var hi);
+            vAccLo += lo;
+            vAccHi += hi;
         }
 
-        float sum = System.Numerics.Vector.Sum(vAcc);
+        double sum = Vector.Sum(vAccLo) + Vector.Sum(vAccHi);
+        for (; i < n; i++)
+        {
+            sum += col[i];
+        }
+        return sum;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static double CenteredDotProductDouble(
+        ReadOnlySpan<float> colA, double meanA,
+        ReadOnlySpan<float> colB, double meanB)
+    {
+        int n = colA.Length;
+        int vecSize = Vector<float>.Count;
+        var vMeanA = new Vector<double>(meanA);
+        var vMeanB = new Vector<double>(meanB);
+        var vAccLo = Vector<double>.Zero;
+        var vAccHi = Vector<double>.Zero;
+
+        int i = 0;
+        for (; i <= n - vecSize; i += vecSize)
+        {
+            Vector.Widen(new Vector<float>(colA.Slice(i, vecSize)), out var aLo, out var aHi);
+            Vector.Widen(new Vector<float>(colB.Slice(i, vecSize)), out var bLo, out var bHi);
+            vAccLo += (aLo - vMeanA) * (bLo - vMeanB);
+            vAccHi += (aHi - vMeanA) * (bHi - vMeanB);
+        }
+
+        double sum = Vector.Sum(vAccLo) + Vector.Sum(vAccHi);
         for (; i < n; i++)
         {
             sum += (colA[i] - meanA) * (colB[i] - meanB);
@@ -343,30 +449,50 @@ public sealed class FastPCA
         return sum;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float Dot(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static float CenteredRowDotProductSimd(
+        ReadOnlySpan<float> row,
+        ReadOnlySpan<float> mean,
+        ReadOnlySpan<float> comp)
     {
-        float sum = 0f;
-        for (int i = 0; i < a.Length; i++) sum += a[i] * b[i];
+        int n = row.Length;
+        int vecSize = Vector<float>.Count;
+        var vAcc = Vector<float>.Zero;
+
+        int i = 0;
+        for (; i <= n - vecSize; i += vecSize)
+        {
+            var vr = new Vector<float>(row.Slice(i, vecSize)) - new Vector<float>(mean.Slice(i, vecSize));
+            var vc = new Vector<float>(comp.Slice(i, vecSize));
+            vAcc += vr * vc;
+        }
+
+        float sum = Vector.Sum(vAcc);
+        for (; i < n; i++)
+        {
+            sum += (row[i] - mean[i]) * comp[i];
+        }
         return sum;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float Norm(ReadOnlySpan<float> v)
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static float DotProductSimd(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
     {
-        float sum = 0f;
-        for (int i = 0; i < v.Length; i++) sum += v[i] * v[i];
-        return MathF.Sqrt(sum);
-    }
+        int n = a.Length;
+        int vecSize = Vector<float>.Count;
+        var vAcc = Vector<float>.Zero;
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void Normalize(Span<float> v)
-    {
-        float norm = Norm(v);
-        if (norm > 1e-12f)
+        int i = 0;
+        for (; i <= n - vecSize; i += vecSize)
         {
-            float inv = 1.0f / norm;
-            for (int i = 0; i < v.Length; i++) v[i] *= inv;
+            vAcc += new Vector<float>(a.Slice(i, vecSize)) * new Vector<float>(b.Slice(i, vecSize));
         }
+
+        float sum = Vector.Sum(vAcc);
+        for (; i < n; i++)
+        {
+            sum += a[i] * b[i];
+        }
+        return sum;
     }
 }

@@ -61,6 +61,7 @@ public class GpuRingBufferMlTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void VectorOperations_GpuNvidiaTarget_WhenAvailable()
     {
         if (!GpuMlAccelerator.IsNvidiaAvailable) return;
@@ -88,6 +89,58 @@ public class GpuRingBufferMlTests
 
             Assert.Equal(expectedAdd, destAdd[i], precision: 3);
             Assert.Equal(expectedFma, destFma[i], precision: 3);
+        }
+    }
+
+    [Fact]
+    [Trait("Hardware", "Gpu")]
+    public void VectorOperations_LargeBatch_AboveAutoThreshold_ExecutesAccurately()
+    {
+        const int length = 70_000; // >= 65536 Auto ring-buffer threshold
+        float[] a = new float[length];
+        float[] b = new float[length];
+        float[] destAdd = new float[length];
+        float[] destFma = new float[length];
+        const float scalar = 2.5f;
+
+        for (int i = 0; i < length; i++)
+        {
+            a[i] = (i % 100) * 0.5f;
+            b[i] = (i % 50) * 1.25f;
+        }
+
+        GpuMlAccelerator.VectorAdd(a, b, destAdd, GpuTarget.Auto);
+        GpuMlAccelerator.VectorFma(a, b, destFma, scalar, GpuTarget.Auto);
+
+        for (int i = 0; i < length; i++)
+        {
+            Assert.Equal(a[i] + b[i], destAdd[i], precision: 3);
+            Assert.Equal(a[i] * scalar + b[i], destFma[i], precision: 3);
+        }
+    }
+
+    [Fact]
+    public void VectorOperations_AutoBelowThreshold_MatchesCpuSimd()
+    {
+        const int length = 65_535; // Just below 65536 threshold -> CPU SIMD
+        float[] a = new float[length];
+        float[] b = new float[length];
+        float[] destAdd = new float[length];
+        float[] destFma = new float[length];
+
+        for (int i = 0; i < length; i++)
+        {
+            a[i] = i * 0.1f;
+            b[i] = i * 0.2f;
+        }
+
+        GpuMlAccelerator.VectorAdd(a, b, destAdd, GpuTarget.Auto);
+        GpuMlAccelerator.VectorFma(a, b, destFma, -1.5f, GpuTarget.Auto);
+
+        for (int i = 0; i < length; i++)
+        {
+            Assert.Equal(a[i] + b[i], destAdd[i], precision: 3);
+            Assert.Equal(a[i] * -1.5f + b[i], destFma[i], precision: 3);
         }
     }
 }

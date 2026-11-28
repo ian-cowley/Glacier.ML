@@ -1,6 +1,10 @@
 using System;
+using Glacier.ML.Clustering;
 using Glacier.ML.Core;
+using Glacier.ML.Decomposition;
 using Glacier.ML.Interop;
+using Glacier.ML.Linear;
+using Glacier.ML.Preprocessing;
 using Glacier.ML.Trees;
 using Glacier.Polaris;
 using Glacier.Polaris.Data;
@@ -214,5 +218,110 @@ public class PolarisInteropTests
         {
             Assert.False(float.IsNaN(reduced[i]));
         }
+    }
+
+    [Fact]
+    public void DataFrame_NullValidityMask_RejectsByDefaultAndSupportsExplicitPolicies()
+    {
+        var f1 = Float32Series.FromValues("f1", new float?[] { 1.0f, null, 3.0f });
+        var f2 = new Float32Series("f2", new float[] { 10.0f, 20.0f, 30.0f });
+        var target = Float32Series.FromValues("y", new float?[] { 0.0f, 1.0f, null });
+        var df = new DataFrame(new ISeries[] { f1, f2, target });
+
+        Assert.Throws<InvalidOperationException>(() => df.ToFeatureMatrix("f1", "f2"));
+        Assert.Throws<InvalidOperationException>(() => df.FitRandomForest("y", new[] { "f2" }, numTrees: 2, maxDepth: 2));
+
+        using var zeroMat = df.ToFeatureMatrix(PolarisNullHandling.ReplaceWithZero, "f1", "f2");
+        Assert.Equal(0.0f, zeroMat.GetValue(1, 0));
+        Assert.Equal(20.0f, zeroMat.GetValue(1, 1));
+
+        using var nanMat = df.ToFeatureMatrix(PolarisNullHandling.ReplaceWithNaN, "f1", "f2");
+        Assert.True(float.IsNaN(nanMat.GetValue(1, 0)));
+        Assert.Equal(20.0f, nanMat.GetValue(1, 1));
+
+        var emptyDf = new DataFrame(new ISeries[] { new Float32Series("x", Array.Empty<float>()) });
+        Assert.Throws<ArgumentException>(() => emptyDf.ToFeatureMatrix("x"));
+    }
+
+    [Fact]
+    public void EstimatorInterfaces_WorkPolymorphicallyAcrossSupervisedAndUnsupervisedModels()
+    {
+        using var matrix = new FeatureMatrix(20, 2);
+        float[] targets = new float[20];
+        for (int i = 0; i < 20; i++)
+        {
+            float x0 = i * 0.5f;
+            float x1 = i < 10 ? 0f : 5f;
+            matrix.SetValue(i, 0, x0);
+            matrix.SetValue(i, 1, x1);
+            targets[i] = i < 10 ? 0f : 1f;
+        }
+
+        static TModel FitSupervised<TModel>(IEstimator<TModel> est, FeatureMatrix x, ReadOnlySpan<float> y) => est.Fit(x, y);
+        static TModel FitUnsupervised<TModel>(IUnsupervisedEstimator<TModel> est, FeatureMatrix x) => est.Fit(x);
+
+        FastLinearRegression lr = FitSupervised<FastLinearRegression>(new FastLinearRegression(), matrix, targets);
+        FastLogisticRegression log = FitSupervised<FastLogisticRegression>(new FastLogisticRegression(epochs: 20), matrix, targets);
+        FastDecisionTree tree = FitSupervised<FastDecisionTree>(new FastDecisionTree(maxDepth: 3), matrix, targets);
+        FastRandomForest rf = FitSupervised<FastRandomForest>(new FastRandomForest(numTrees: 4, maxDepth: 3), matrix, targets);
+
+        Assert.Equal(2, lr.Weights.Length);
+        Assert.Equal(2, log.Weights.Length);
+        Assert.NotEmpty(tree.Nodes);
+        Assert.Equal(4, rf.Trees.Length);
+
+        KMeans km = FitUnsupervised<KMeans>(new KMeans(k: 2, target: GpuTarget.Cpu), matrix);
+        FastPCA pca = FitUnsupervised<FastPCA>(new FastPCA(nComponents: 1), matrix);
+        StandardScaler std = FitUnsupervised<StandardScaler>(new StandardScaler(), matrix);
+        MinMaxScaler mm = FitUnsupervised<MinMaxScaler>(new MinMaxScaler(), matrix);
+
+        Assert.Equal(4, km.Centroids.Length);
+        Assert.Equal(1, pca.NComponents);
+        Assert.NotNull(std.Means);
+        Assert.NotNull(mm.Mins);
+    }
+
+    [Fact]
+    public void DataFrame_ReplaceWithNaN_DecisionTreeAndRandomForest_AchieveFullAccuracy()
+    {
+        const int rows = 90;
+        float?[] xVals = new float?[rows];
+        float[] yVals = new float[rows];
+        for (int i = 0; i < rows; i++)
+        {
+            if (i < 30)
+            {
+                xVals[i] = null; // becomes NaN
+                yVals[i] = 1.0f;
+            }
+            else if (i < 60)
+            {
+                xVals[i] = 1.0f;
+                yVals[i] = 0.0f;
+            }
+            else
+            {
+                xVals[i] = 2.0f;
+                yVals[i] = 0.0f;
+            }
+        }
+
+        var colX = Float32Series.FromValues("x", xVals);
+        var colY = new Float32Series("y", yVals);
+        var df = new DataFrame(new ISeries[] { colX, colY });
+
+        using var mat = df.ToFeatureMatrix(PolarisNullHandling.ReplaceWithNaN, "x");
+        var tree = new FastDecisionTree(maxDepth: 2, minSamplesSplit: 2);
+        tree.Fit(mat, yVals);
+
+        float[] treePreds = new float[rows];
+        tree.Predict(mat, treePreds);
+        Assert.Equal(1.0f, Metrics.Accuracy(yVals, treePreds));
+
+        var rf = new FastRandomForest(numTrees: 5, maxDepth: 2, minSamplesSplit: 2, subsampleRatio: 1.0f);
+        rf.Fit(mat, yVals);
+        float[] rfPreds = new float[rows];
+        rf.Predict(mat, rfPreds);
+        Assert.Equal(1.0f, Metrics.Accuracy(yVals, rfPreds));
     }
 }

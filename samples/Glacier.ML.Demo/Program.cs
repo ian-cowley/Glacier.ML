@@ -22,8 +22,8 @@ Console.WriteLine("Hardware Acceleration Status:");
 Console.WriteLine($"  - CPU AVX-512 FMA:      {Vector512.IsHardwareAccelerated && Avx512F.IsSupported}");
 Console.WriteLine($"  - CPU AVX2 Vector256:   {Vector256.IsHardwareAccelerated && Avx2.IsSupported}");
 Console.WriteLine($"  - CPU Cores / Threads:  {Environment.ProcessorCount}");
-Console.WriteLine($"  - NVIDIA RTX 4060 dGPU: {GpuMlAccelerator.IsNvidiaAvailable} (Direct nvcuda.dll PTX)");
-Console.WriteLine($"  - AMD Radeon 890M APU:  {GpuMlAccelerator.IsAmdAvailable} (Direct amdhip64.dll)");
+Console.WriteLine($"  - NVIDIA CUDA dGPU:     {GpuMlAccelerator.IsNvidiaAvailable} (Direct nvcuda.dll PTX)");
+Console.WriteLine($"  - AMD ROCm/HIP APU:     {GpuMlAccelerator.IsAmdAvailable} (Not supported in Glacier.ML)");
 Console.WriteLine();
 
 const int numSamples = 100_000;
@@ -34,7 +34,7 @@ Console.WriteLine($"[1/5] Synthesizing {numSamples:N0} records with {numFeatures
 Console.ResetColor();
 
 var sw = Stopwatch.StartNew();
-var matrix = new FeatureMatrix(numSamples, numFeatures);
+using var matrix = new FeatureMatrix(numSamples, numFeatures);
 float[] targets = new float[numSamples];
 
 var rng = new Random(42);
@@ -78,13 +78,12 @@ Console.WriteLine($"  -> Model Accuracy: {accuracy * 100:F2}%\n");
 Console.ResetColor();
 
 // -----------------------------------------------------------------------------
-// [3/5] FastLinearRegression (Normal Equations on GPU vs CPU)
+// [3/5] FastLinearRegression (Double-Precision Normal Equations on CPU SIMD)
 // -----------------------------------------------------------------------------
 Console.ForegroundColor = ConsoleColor.Yellow;
-Console.WriteLine("[3/5] Benchmarking FastLinearRegression (Closed-Form Normal Equations: X^T * X on GPU vs CPU)...");
+Console.WriteLine("[3/5] Benchmarking FastLinearRegression (Double-Precision Normal Equations on Multi-Core CPU SIMD)...");
 Console.ResetColor();
 
-// CPU OLS
 var lrCpu = new FastLinearRegression(alpha: 0.01f, fitIntercept: true, target: GpuTarget.Cpu);
 sw.Restart();
 lrCpu.Fit(matrix, targets);
@@ -95,28 +94,27 @@ float[] lrPredCpu = new float[numSamples];
 sw.Restart();
 lrCpu.Predict(matrix, lrPredCpu);
 sw.Stop();
-Console.WriteLine($"  -> CPU AVX-512 Fit:     {lrCpuMs} ms | Predict: {sw.ElapsedMilliseconds} ms | R2: {Metrics.R2Score(targets, lrPredCpu):F4}");
+Console.WriteLine($"  -> CPU SIMD Fit:        {lrCpuMs} ms | Predict: {sw.ElapsedMilliseconds} ms | R2: {Metrics.R2Score(targets, lrPredCpu):F4}");
 
-// GPU OLS
-var lrGpu = new FastLinearRegression(alpha: 0.01f, fitIntercept: true, target: GpuTarget.Auto);
+var lrAuto = new FastLinearRegression(alpha: 0.01f, fitIntercept: true, target: GpuTarget.Auto);
 sw.Restart();
-lrGpu.Fit(matrix, targets);
+lrAuto.Fit(matrix, targets);
 sw.Stop();
-long lrGpuMs = sw.ElapsedMilliseconds;
+long lrAutoMs = sw.ElapsedMilliseconds;
 
-float[] lrPredGpu = new float[numSamples];
+float[] lrPredAuto = new float[numSamples];
 sw.Restart();
-lrGpu.Predict(matrix, lrPredGpu);
+lrAuto.Predict(matrix, lrPredAuto);
 sw.Stop();
 Console.ForegroundColor = ConsoleColor.Green;
-Console.WriteLine($"  -> GPU (RTX 4060) Fit:  {lrGpuMs} ms | Predict: {sw.ElapsedMilliseconds} ms | R2: {Metrics.R2Score(targets, lrPredGpu):F4}\n");
+Console.WriteLine($"  -> Auto (CPU SIMD) Fit: {lrAutoMs} ms | Predict: {sw.ElapsedMilliseconds} ms | R2: {Metrics.R2Score(targets, lrPredAuto):F4}\n");
 Console.ResetColor();
 
 // -----------------------------------------------------------------------------
-// [4/5] FastPCA (Covariance Gram Matrix & Feature Projection)
+// [4/5] FastPCA (Double-Precision Covariance & Symmetric Jacobi Eigensolver)
 // -----------------------------------------------------------------------------
 Console.ForegroundColor = ConsoleColor.Yellow;
-Console.WriteLine("[4/5] Benchmarking FastPCA (Principal Component Analysis, 3 components, GPU-Accelerated Covariance)...");
+Console.WriteLine("[4/5] Benchmarking FastPCA (Principal Component Analysis, 3 components, CPU SIMD + Jacobi)...");
 Console.ResetColor();
 
 var pca = new FastPCA(nComponents: 3, target: GpuTarget.Auto);

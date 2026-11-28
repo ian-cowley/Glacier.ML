@@ -15,12 +15,14 @@ using Glacier.ML.Core;
 namespace Glacier.ML.Compute;
 
 /// <summary>
-/// High-performance GPU hardware accelerator for Glacier.ML algorithms.
-/// Delivers bare-metal offload for K-Means cluster assignment, PCA covariance calculations,
-/// and Linear/Ridge regression normal equations.
+/// Hardware accelerator for Glacier.ML operations.
+/// Delivers bare-metal NVIDIA CUDA offload for K-Means cluster assignment and persistent ring-buffer
+/// vector kernels (<see cref="VectorAdd"/> / <see cref="VectorFma"/>), and multi-core CPU SIMD for
+/// <see cref="ComputeGramMatrix"/> and <see cref="ProjectFeatures"/>.
 /// </summary>
 public static unsafe class GpuMlAccelerator
 {
+    private const int RingBufferAutoThreshold = 65536;
     private static readonly Lock s_initLock = new();
     private static readonly Lock s_ringBufferLock = new();
     private static readonly System.Collections.Concurrent.ConcurrentQueue<GpuMlStreamContext> s_streamPool = new();
@@ -41,7 +43,6 @@ public static unsafe class GpuMlAccelerator
     private static IntPtr s_cuContext;
     private static IntPtr s_cuModule;
     private static IntPtr s_fnKMeansAssign;
-    private static IntPtr s_fnSigmoid;
 
 
     // Persistent Megakernel Ring Buffer engine & unified device-mapped memory
@@ -98,14 +99,18 @@ public static unsafe class GpuMlAccelerator
                 }
 
                 // Check compute capability
-                CuDriver.DeviceGetAttribute(out int major, 75, dev); // CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR
-                CuDriver.DeviceGetAttribute(out int minor, 76, dev); // CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR
+                if (CuDriver.DeviceGetAttribute(out int major, 75, dev) != 0 ||
+                    CuDriver.DeviceGetAttribute(out int minor, 76, dev) != 0)
+                {
+                    s_nvidiaAvailable = false;
+                    return false;
+                }
                 string targetArch = $"sm_{major}{minor}";
 
                 if (CuDriver.CtxCreate(out s_cuContext, 0, dev) != 0)
                 {
+                    s_cuContext = IntPtr.Zero;
                     s_nvidiaAvailable = false;
-                    s_nvidiaInitialized = true;
                     return false;
                 }
 
@@ -114,16 +119,17 @@ public static unsafe class GpuMlAccelerator
                 byte[] ptxBytes = Encoding.UTF8.GetBytes(ptx + "\0");
                 if (CuDriver.ModuleLoadData(out s_cuModule, ptxBytes) != 0)
                 {
+                    s_cuModule = IntPtr.Zero;
+                    CleanupNvidiaInitState();
                     s_nvidiaAvailable = false;
-                    s_nvidiaInitialized = true;
                     return false;
                 }
 
-                if (CuDriver.ModuleGetFunction(out s_fnKMeansAssign, s_cuModule, "kmeans_assign_fp32") != 0 ||
-                    CuDriver.ModuleGetFunction(out s_fnSigmoid, s_cuModule, "vector_sigmoid_fp32") != 0)
+                if (CuDriver.ModuleGetFunction(out s_fnKMeansAssign, s_cuModule, "kmeans_assign_fp32") != 0)
                 {
+                    s_fnKMeansAssign = IntPtr.Zero;
+                    CleanupNvidiaInitState();
                     s_nvidiaAvailable = false;
-                    s_nvidiaInitialized = true;
                     return false;
                 }
 
@@ -131,6 +137,7 @@ public static unsafe class GpuMlAccelerator
             }
             catch
             {
+                CleanupNvidiaInitState();
                 s_nvidiaAvailable = false;
             }
             finally
@@ -142,13 +149,29 @@ public static unsafe class GpuMlAccelerator
         }
     }
 
+    private static void CleanupNvidiaInitState()
+    {
+        if (s_cuModule != IntPtr.Zero)
+        {
+            CuDriver.ModuleUnload(s_cuModule);
+            s_cuModule = IntPtr.Zero;
+        }
+        if (s_cuContext != IntPtr.Zero)
+        {
+            CuDriver.CtxDestroy(s_cuContext);
+            s_cuContext = IntPtr.Zero;
+        }
+        s_fnKMeansAssign = IntPtr.Zero;
+    }
+
     #endregion
 
     #region K-Means Assignment Offload
 
     /// <summary>
     /// Executes nearest-centroid assignment across N samples on the specified hardware target.
-    /// Returns true if executed on GPU, false if caller should use CPU fallback.
+    /// Returns true if executed on NVIDIA GPU, false if caller should use CPU fallback.
+    /// Throws <see cref="NotSupportedException"/> for unsupported targets (<see cref="GpuTarget.Amd"/>, <see cref="GpuTarget.DualGpu"/>).
     /// </summary>
     public static bool AssignClustersGpu(
         ReadOnlySpan<float> samples,
@@ -159,6 +182,9 @@ public static unsafe class GpuMlAccelerator
         int d,
         GpuTarget target = GpuTarget.Auto)
     {
+        if (target is GpuTarget.Amd or GpuTarget.DualGpu)
+            throw new NotSupportedException($"GpuTarget.{target} is not supported by GpuMlAccelerator.AssignClustersGpu. Use Auto, Nvidia, or Cpu.");
+
         if (n <= 0 || k <= 0 || d <= 0) return false;
 
         switch (target)
@@ -169,11 +195,7 @@ public static unsafe class GpuMlAccelerator
             case GpuTarget.Nvidia:
                 return ExecuteNvidiaKMeansAssign(samples, centroids, assignments, n, k, d);
 
-            case GpuTarget.Amd:
-                return false;
-
             case GpuTarget.Auto:
-            default:
                 // For small datasets (< 512 rows), CPU AVX-512 is fast enough without PCIe round-trip
                 if (n < 512) return false;
 
@@ -181,6 +203,9 @@ public static unsafe class GpuMlAccelerator
                     return true;
 
                 return false;
+
+            default:
+                throw new NotSupportedException($"GpuTarget.{target} is not supported.");
         }
     }
 
@@ -193,17 +218,27 @@ public static unsafe class GpuMlAccelerator
         int d)
     {
         if (!EnsureNvidiaInitialized()) return false;
-        if (samples.Length < n * d || centroids.Length < k * d || assignments.Length < n)
+
+        long sampleElements = (long)n * d;
+        long centroidElements = (long)k * d;
+        // kmeans_assign_fp32 PTX computes 32-bit offsets via mul.lo.s32
+        if (sampleElements > int.MaxValue || centroidElements > int.MaxValue)
+            return false;
+        if (samples.Length < sampleElements || centroids.Length < centroidElements || assignments.Length < n)
             return false;
 
-        nuint bytesSamples = (nuint)(n * d * sizeof(float));
-        nuint bytesCentroids = (nuint)(k * d * sizeof(float));
-        nuint bytesAssignments = (nuint)(n * sizeof(int));
+        nuint bytesSamples = checked((nuint)sampleElements * sizeof(float));
+        nuint bytesCentroids = checked((nuint)centroidElements * sizeof(float));
+        nuint bytesAssignments = checked((nuint)(uint)n * sizeof(int));
 
         GpuMlStreamContext ctx = RentContext();
         try
         {
-            CuDriver.CtxSetCurrent(s_cuContext);
+            if (ctx.Stream == IntPtr.Zero)
+                return false;
+            if (CuDriver.CtxSetCurrent(s_cuContext) != 0)
+                return false;
+
             ctx.EnsureCapacity(bytesSamples, bytesCentroids, bytesAssignments);
             if (ctx.DeviceSamples == IntPtr.Zero || ctx.DeviceCentroids == IntPtr.Zero || ctx.DeviceAssignments == IntPtr.Zero)
                 return false;
@@ -212,8 +247,10 @@ public static unsafe class GpuMlAccelerator
             fixed (float* pCentroids = centroids)
             fixed (int* pAssignments = assignments)
             {
-                CuDriver.MemcpyHtoDAsync(ctx.DeviceSamples, (IntPtr)pSamples, bytesSamples, ctx.Stream);
-                CuDriver.MemcpyHtoDAsync(ctx.DeviceCentroids, (IntPtr)pCentroids, bytesCentroids, ctx.Stream);
+                if (CuDriver.MemcpyHtoDAsync(ctx.DeviceSamples, (IntPtr)pSamples, bytesSamples, ctx.Stream) != 0)
+                    return false;
+                if (CuDriver.MemcpyHtoDAsync(ctx.DeviceCentroids, (IntPtr)pCentroids, bytesCentroids, ctx.Stream) != 0)
+                    return false;
 
                 IntPtr argSamples = ctx.DeviceSamples;
                 IntPtr argCentroids = ctx.DeviceCentroids;
@@ -231,7 +268,7 @@ public static unsafe class GpuMlAccelerator
                 pKernelParams[5] = &argD;
 
                 uint blockSize = 256;
-                uint gridSize = (uint)((n + 255) / 256);
+                uint gridSize = (uint)(((long)n + 255) / 256);
 
                 int launchRes = CuDriver.LaunchKernel(
                     s_fnKMeansAssign,
@@ -243,8 +280,11 @@ public static unsafe class GpuMlAccelerator
 
                 if (launchRes != 0) return false;
 
-                CuDriver.MemcpyDtoHAsync((IntPtr)pAssignments, ctx.DeviceAssignments, bytesAssignments, ctx.Stream);
-                CuDriver.StreamSynchronize(ctx.Stream);
+                if (CuDriver.MemcpyDtoHAsync((IntPtr)pAssignments, ctx.DeviceAssignments, bytesAssignments, ctx.Stream) != 0)
+                    return false;
+                if (CuDriver.StreamSynchronize(ctx.Stream) != 0)
+                    return false;
+
                 return true;
             }
         }
@@ -260,35 +300,65 @@ public static unsafe class GpuMlAccelerator
 
     #endregion
 
-    #region Matrix Operations (GEMM / Gram Matrix / Projection)
+    #region Matrix Operations (CPU SIMD Gram Matrix / Projection)
 
     /// <summary>
-    /// Computes the Gram matrix G = X^T * X (size D x D) from feature matrix X (size N x D).
-    /// Highly optimized for PCA and Linear Regression normal equations.
+    /// Computes the Gram matrix G = X^T * X (size D x D) from feature matrix X (size N x D) on multi-core CPU SIMD.
+    /// Supports <see cref="GpuTarget.Auto"/> and <see cref="GpuTarget.Cpu"/>; throws <see cref="NotSupportedException"/> for GPU-only targets.
     /// </summary>
     public static void ComputeGramMatrix(FeatureMatrix x, Span<float> gram, GpuTarget target = GpuTarget.Auto)
     {
+        ArgumentNullException.ThrowIfNull(x);
+        if (target is GpuTarget.Nvidia or GpuTarget.Amd or GpuTarget.DualGpu)
+            throw new NotSupportedException($"GpuTarget.{target} is not supported by ComputeGramMatrix (CPU SIMD only). Use Auto or Cpu.");
+
         int n = x.Rows;
         int d = x.Columns;
-        if (gram.Length < d * d)
+        long dd = (long)d * d;
+        if (gram.Length < dd)
             throw new ArgumentException("Gram buffer is too small.", nameof(gram));
+        if (n == 0 || d == 0) return;
+
+        if (x.IsColumnar)
+        {
+            ReadOnlyMemory<float>[] colMemories = new ReadOnlyMemory<float>[d];
+            for (int c = 0; c < d; c++) colMemories[c] = x.GetColumnMemory(c);
+
+            fixed (float* pGram = gram)
+            {
+                float* pG = pGram;
+                Parallel.For(0, d, i =>
+                {
+                    ReadOnlySpan<float> colI = colMemories[i].Span;
+                    for (int j = i; j < d; j++)
+                    {
+                        float val = DotProductSimd(colI, colMemories[j].Span);
+                        pG[(long)i * d + j] = val;
+                        pG[(long)j * d + i] = val;
+                    }
+                });
+            }
+            return;
+        }
 
         // Transpose X into X_T (size D x N) using 64-byte aligned unmanaged scratchpad to avoid LOH fragmentation
-        nuint byteCount = (nuint)d * (nuint)n * sizeof(float);
+        nuint byteCount = checked((nuint)((long)d * n * sizeof(float)));
         float* pXTransposed = (float*)NativeMemory.AlignedAlloc(byteCount, 64);
 
         try
         {
-            float[] xRaw = x.RawArray;
-
-            System.Threading.Tasks.Parallel.For(0, d, col =>
+            fixed (float* pXRaw = x.Span)
             {
-                int colOffset = col * n;
-                for (int row = 0; row < n; row++)
+                float* pSrc = pXRaw;
+                Parallel.For(0, d, col =>
                 {
-                    pXTransposed[colOffset + row] = xRaw[row * d + col];
-                }
-            });
+                    long colOffset = (long)col * n;
+                    for (int row = 0; row < n; row++)
+                    {
+                        pXTransposed[colOffset + row] = pSrc[(long)row * d + col];
+                    }
+                });
+            }
 
             // Symmetric Gram calculation: G[i, j] = G[j, i] = dot(col_i, col_j)
             fixed (float* pGram = gram)
@@ -296,13 +366,13 @@ public static unsafe class GpuMlAccelerator
                 float* pG = pGram;
                 Parallel.For(0, d, i =>
                 {
-                    var colI = new ReadOnlySpan<float>(pXTransposed + (i * n), n);
+                    var colI = new ReadOnlySpan<float>(pXTransposed + ((long)i * n), n);
                     for (int j = i; j < d; j++)
                     {
-                        var colJ = new ReadOnlySpan<float>(pXTransposed + (j * n), n);
+                        var colJ = new ReadOnlySpan<float>(pXTransposed + ((long)j * n), n);
                         float val = DotProductSimd(colI, colJ);
-                        pG[i * d + j] = val;
-                        pG[j * d + i] = val;
+                        pG[(long)i * d + j] = val;
+                        pG[(long)j * d + i] = val;
                     }
                 });
             }
@@ -314,8 +384,8 @@ public static unsafe class GpuMlAccelerator
     }
 
     /// <summary>
-    /// Computes feature projection Y = X * W where X is (N x D) and W is (D x K), producing (N x K).
-    /// Highly optimized with SIMD multi-threading for PCA dimensionality reduction and linear prediction.
+    /// Computes feature projection Y = X * W where X is (N x D) and W is (D x K), producing (N x K) on multi-core CPU SIMD.
+    /// Supports <see cref="GpuTarget.Auto"/> and <see cref="GpuTarget.Cpu"/>; throws <see cref="NotSupportedException"/> for GPU-only targets.
     /// </summary>
     public static void ProjectFeatures(
         FeatureMatrix x,
@@ -324,39 +394,78 @@ public static unsafe class GpuMlAccelerator
         int k,
         GpuTarget target = GpuTarget.Auto)
     {
+        ArgumentNullException.ThrowIfNull(x);
+        if (target is GpuTarget.Nvidia or GpuTarget.Amd or GpuTarget.DualGpu)
+            throw new NotSupportedException($"GpuTarget.{target} is not supported by ProjectFeatures (CPU SIMD only). Use Auto or Cpu.");
+        if (k <= 0)
+            throw new ArgumentOutOfRangeException(nameof(k), "Projection component count k must be positive.");
+
         int n = x.Rows;
         int d = x.Columns;
-        if (weights.Length < d * k)
+        if (weights.Length < (long)d * k)
             throw new ArgumentException("Weights buffer length mismatch.", nameof(weights));
-        if (destination.Length < n * k)
+        if (destination.Length < (long)n * k)
             throw new ArgumentException("Destination buffer length mismatch.", nameof(destination));
+        if (n == 0 || d == 0) return;
 
-        float[] xRaw = x.RawArray;
+        if (x.IsColumnar)
+        {
+            ReadOnlyMemory<float>[] colMemories = new ReadOnlyMemory<float>[d];
+            for (int c = 0; c < d; c++) colMemories[c] = x.GetColumnMemory(c);
+
+            fixed (float* pW = weights)
+            fixed (float* pDest = destination)
+            {
+                float* pWPtr = pW;
+                float* pD = pDest;
+                Parallel.For(0, n, i =>
+                {
+                    long yOffset = (long)i * k;
+                    for (int j = 0; j < k; j++)
+                    {
+                        pD[yOffset + j] = 0f;
+                    }
+                    for (int p = 0; p < d; p++)
+                    {
+                        float xp = colMemories[p].Span[i];
+                        long wRow = (long)p * k;
+                        for (int j = 0; j < k; j++)
+                        {
+                            pD[yOffset + j] += xp * pWPtr[wRow + j];
+                        }
+                    }
+                });
+            }
+            return;
+        }
 
         // Transpose weights so each component's weights of length D are contiguous in memory: W_T (K x D)
-        nuint byteCount = (nuint)k * (nuint)d * sizeof(float);
+        nuint byteCount = checked((nuint)((long)k * d * sizeof(float)));
         float* pWTransposed = (float*)NativeMemory.AlignedAlloc(byteCount, 64);
 
         try
         {
             for (int p = 0; p < d; p++)
             {
+                long pRow = (long)p * k;
                 for (int j = 0; j < k; j++)
                 {
-                    pWTransposed[j * d + p] = weights[p * k + j];
+                    pWTransposed[(long)j * d + p] = weights[(int)(pRow + j)];
                 }
             }
 
+            fixed (float* pXRaw = x.Span)
             fixed (float* pDest = destination)
             {
+                float* pSrc = pXRaw;
                 float* pD = pDest;
                 Parallel.For(0, n, i =>
                 {
-                    ReadOnlySpan<float> xRow = xRaw.AsSpan(i * d, d);
-                    int yOffset = i * k;
+                    var xRow = new ReadOnlySpan<float>(pSrc + ((long)i * d), d);
+                    long yOffset = (long)i * k;
                     for (int j = 0; j < k; j++)
                     {
-                        ReadOnlySpan<float> wComp = new ReadOnlySpan<float>(pWTransposed + (j * d), d);
+                        var wComp = new ReadOnlySpan<float>(pWTransposed + ((long)j * d), d);
                         pD[yOffset + j] = DotProductSimd(xRow, wComp);
                     }
                 });
@@ -484,14 +593,29 @@ public static unsafe class GpuMlAccelerator
         s_capVecBytes = 0;
 
         uint flags = CuDriver.CU_MEMHOSTALLOC_DEVICEMAP | CuDriver.CU_MEMHOSTALLOC_PORTABLE;
-        if (CuDriver.MemHostAlloc(out s_hVecA, allocBytes, flags) != 0) return false;
-        if (CuDriver.MemHostGetDevicePointer(out s_dVecA, s_hVecA, 0) != 0) return false;
+        IntPtr hA = IntPtr.Zero, dA = IntPtr.Zero;
+        IntPtr hB = IntPtr.Zero, dB = IntPtr.Zero;
+        IntPtr hC = IntPtr.Zero, dC = IntPtr.Zero;
 
-        if (CuDriver.MemHostAlloc(out s_hVecB, allocBytes, flags) != 0) return false;
-        if (CuDriver.MemHostGetDevicePointer(out s_dVecB, s_hVecB, 0) != 0) return false;
+        if (CuDriver.MemHostAlloc(out hA, allocBytes, flags) != 0 ||
+            CuDriver.MemHostGetDevicePointer(out dA, hA, 0) != 0 ||
+            CuDriver.MemHostAlloc(out hB, allocBytes, flags) != 0 ||
+            CuDriver.MemHostGetDevicePointer(out dB, hB, 0) != 0 ||
+            CuDriver.MemHostAlloc(out hC, allocBytes, flags) != 0 ||
+            CuDriver.MemHostGetDevicePointer(out dC, hC, 0) != 0)
+        {
+            if (hA != IntPtr.Zero) CuDriver.MemFreeHost(hA);
+            if (hB != IntPtr.Zero) CuDriver.MemFreeHost(hB);
+            if (hC != IntPtr.Zero) CuDriver.MemFreeHost(hC);
+            return false;
+        }
 
-        if (CuDriver.MemHostAlloc(out s_hVecC, allocBytes, flags) != 0) return false;
-        if (CuDriver.MemHostGetDevicePointer(out s_dVecC, s_hVecC, 0) != 0) return false;
+        s_hVecA = hA;
+        s_dVecA = dA;
+        s_hVecB = hB;
+        s_dVecB = dB;
+        s_hVecC = hC;
+        s_dVecC = dC;
 
         s_capVecBytes = allocBytes;
         if (wasRingRunning && s_nvidiaEngine != null)
@@ -504,8 +628,9 @@ public static unsafe class GpuMlAccelerator
 
     /// <summary>
     /// Executes element-wise vector addition: C = A + B.
-    /// Dispatches to the persistent GPU ring buffer when available, with sub-microsecond latency
-    /// and zero PCIe driver overhead, otherwise executes hardware SIMD.
+    /// Dispatches to the persistent GPU ring buffer when available for large vectors (&gt;= 65536 under Auto)
+    /// or explicit <see cref="GpuTarget.Nvidia"/>, otherwise executes hardware SIMD.
+    /// Throws <see cref="NotSupportedException"/> for unsupported targets (<see cref="GpuTarget.Amd"/>, <see cref="GpuTarget.DualGpu"/>).
     /// </summary>
     public static void VectorAdd(
         ReadOnlySpan<float> a,
@@ -513,6 +638,9 @@ public static unsafe class GpuMlAccelerator
         Span<float> destination,
         GpuTarget target = GpuTarget.Auto)
     {
+        if (target is GpuTarget.Amd or GpuTarget.DualGpu)
+            throw new NotSupportedException($"GpuTarget.{target} is not supported by GpuMlAccelerator.VectorAdd. Use Auto, Nvidia, or Cpu.");
+
         int count = a.Length;
         if (b.Length != count || destination.Length < count)
             throw new ArgumentException("Vector dimension mismatch.");
@@ -523,7 +651,8 @@ public static unsafe class GpuMlAccelerator
         {
             GpuTarget.Cpu => false,
             GpuTarget.Nvidia => true,
-            _ => count >= 256 && IsNvidiaAvailable
+            GpuTarget.Auto => count >= RingBufferAutoThreshold && IsNvidiaAvailable,
+            _ => throw new NotSupportedException($"GpuTarget.{target} is not supported.")
         };
 
         if (useGpu && ExecuteRingBufferVectorOp(TaskOpCode.VectorAdd, a, b, destination, 0f))
@@ -535,8 +664,9 @@ public static unsafe class GpuMlAccelerator
     /// <summary>
     /// Executes element-wise fused multiply-add: C = A * scalar + B.
     /// Essential for gradient descent updates: W = grad * (-lr) + W.
-    /// Dispatches to the persistent GPU ring buffer when available, with sub-microsecond latency,
-    /// otherwise executes hardware SIMD.
+    /// Dispatches to the persistent GPU ring buffer when available for large vectors (&gt;= 65536 under Auto)
+    /// or explicit <see cref="GpuTarget.Nvidia"/>, otherwise executes hardware SIMD.
+    /// Throws <see cref="NotSupportedException"/> for unsupported targets (<see cref="GpuTarget.Amd"/>, <see cref="GpuTarget.DualGpu"/>).
     /// </summary>
     public static void VectorFma(
         ReadOnlySpan<float> a,
@@ -545,6 +675,9 @@ public static unsafe class GpuMlAccelerator
         float scalar,
         GpuTarget target = GpuTarget.Auto)
     {
+        if (target is GpuTarget.Amd or GpuTarget.DualGpu)
+            throw new NotSupportedException($"GpuTarget.{target} is not supported by GpuMlAccelerator.VectorFma. Use Auto, Nvidia, or Cpu.");
+
         int count = a.Length;
         if (b.Length != count || destination.Length < count)
             throw new ArgumentException("Vector dimension mismatch.");
@@ -555,7 +688,8 @@ public static unsafe class GpuMlAccelerator
         {
             GpuTarget.Cpu => false,
             GpuTarget.Nvidia => true,
-            _ => count >= 256 && IsNvidiaAvailable
+            GpuTarget.Auto => count >= RingBufferAutoThreshold && IsNvidiaAvailable,
+            _ => throw new NotSupportedException($"GpuTarget.{target} is not supported.")
         };
 
         if (useGpu && ExecuteRingBufferVectorOp(TaskOpCode.VectorFma, a, b, destination, scalar))
@@ -574,7 +708,7 @@ public static unsafe class GpuMlAccelerator
         if (!EnsureNvidiaInitialized()) return false;
 
         int count = a.Length;
-        nuint bytes = (nuint)(count * sizeof(float));
+        nuint bytes = checked((nuint)(uint)count * sizeof(float));
 
         lock (s_ringBufferLock)
         {
@@ -587,7 +721,8 @@ public static unsafe class GpuMlAccelerator
                         s_nvidiaEngine.Initialize();
                 }
 
-                CuDriver.CtxSetCurrent(s_nvidiaEngine.ContextHandle);
+                if (CuDriver.CtxSetCurrent(s_nvidiaEngine.ContextHandle) != 0)
+                    return false;
 
                 if (!EnsureVectorBuffers(bytes))
                     return false;
@@ -719,8 +854,8 @@ public sealed class GpuMlStreamContext : IDisposable
     {
         if (GpuMlAccelerator.IsNvidiaAvailable && GpuMlAccelerator.ContextHandle != IntPtr.Zero)
         {
-            CuDriver.CtxSetCurrent(GpuMlAccelerator.ContextHandle);
-            if (CuDriver.StreamCreate(out IntPtr stream, CuDriver.CU_STREAM_NON_BLOCKING) == 0)
+            if (CuDriver.CtxSetCurrent(GpuMlAccelerator.ContextHandle) == 0 &&
+                CuDriver.StreamCreate(out IntPtr stream, CuDriver.CU_STREAM_NON_BLOCKING) == 0)
             {
                 Stream = stream;
             }
@@ -732,50 +867,51 @@ public sealed class GpuMlStreamContext : IDisposable
         if (!GpuMlAccelerator.IsNvidiaAvailable || GpuMlAccelerator.ContextHandle == IntPtr.Zero)
             return;
 
-        CuDriver.CtxSetCurrent(GpuMlAccelerator.ContextHandle);
+        if (CuDriver.CtxSetCurrent(GpuMlAccelerator.ContextHandle) != 0)
+            return;
 
         if (bytesSamples > CapSamples)
         {
-            if (DeviceSamples != IntPtr.Zero) CuDriver.MemFree(DeviceSamples);
+            if (DeviceSamples != IntPtr.Zero)
+            {
+                CuDriver.MemFree(DeviceSamples);
+                DeviceSamples = IntPtr.Zero;
+                CapSamples = 0;
+            }
             if (CuDriver.MemAlloc(out IntPtr dS, bytesSamples) == 0)
             {
                 DeviceSamples = dS;
                 CapSamples = bytesSamples;
             }
-            else
-            {
-                DeviceSamples = IntPtr.Zero;
-                CapSamples = 0;
-            }
         }
 
         if (bytesCentroids > CapCentroids)
         {
-            if (DeviceCentroids != IntPtr.Zero) CuDriver.MemFree(DeviceCentroids);
+            if (DeviceCentroids != IntPtr.Zero)
+            {
+                CuDriver.MemFree(DeviceCentroids);
+                DeviceCentroids = IntPtr.Zero;
+                CapCentroids = 0;
+            }
             if (CuDriver.MemAlloc(out IntPtr dC, bytesCentroids) == 0)
             {
                 DeviceCentroids = dC;
                 CapCentroids = bytesCentroids;
             }
-            else
-            {
-                DeviceCentroids = IntPtr.Zero;
-                CapCentroids = 0;
-            }
         }
 
         if (bytesAssignments > CapAssignments)
         {
-            if (DeviceAssignments != IntPtr.Zero) CuDriver.MemFree(DeviceAssignments);
+            if (DeviceAssignments != IntPtr.Zero)
+            {
+                CuDriver.MemFree(DeviceAssignments);
+                DeviceAssignments = IntPtr.Zero;
+                CapAssignments = 0;
+            }
             if (CuDriver.MemAlloc(out IntPtr dA, bytesAssignments) == 0)
             {
                 DeviceAssignments = dA;
                 CapAssignments = bytesAssignments;
-            }
-            else
-            {
-                DeviceAssignments = IntPtr.Zero;
-                CapAssignments = 0;
             }
         }
     }
@@ -785,12 +921,12 @@ public sealed class GpuMlStreamContext : IDisposable
         if (!_disposed)
         {
             _disposed = true;
-            if (GpuMlAccelerator.IsNvidiaAvailable && GpuMlAccelerator.ContextHandle != IntPtr.Zero)
+            if (GpuMlAccelerator.IsNvidiaAvailable && GpuMlAccelerator.ContextHandle != IntPtr.Zero &&
+                CuDriver.CtxSetCurrent(GpuMlAccelerator.ContextHandle) == 0)
             {
-                CuDriver.CtxSetCurrent(GpuMlAccelerator.ContextHandle);
-                if (DeviceSamples != IntPtr.Zero) CuDriver.MemFree(DeviceSamples);
-                if (DeviceCentroids != IntPtr.Zero) CuDriver.MemFree(DeviceCentroids);
-                if (DeviceAssignments != IntPtr.Zero) CuDriver.MemFree(DeviceAssignments);
+                if (DeviceSamples != IntPtr.Zero) { CuDriver.MemFree(DeviceSamples); DeviceSamples = IntPtr.Zero; }
+                if (DeviceCentroids != IntPtr.Zero) { CuDriver.MemFree(DeviceCentroids); DeviceCentroids = IntPtr.Zero; }
+                if (DeviceAssignments != IntPtr.Zero) { CuDriver.MemFree(DeviceAssignments); DeviceAssignments = IntPtr.Zero; }
                 if (Stream != IntPtr.Zero) CuDriver.StreamDestroy(Stream);
             }
         }
